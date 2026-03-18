@@ -29,6 +29,24 @@ We recommend cloning the repository using the `--single-branch` option to avoid 
 ```bash
 git clone https://github.com/hustvl/GaussTR.git --single-branch
 cd GaussTR
+
+conda create -n gausstr python=3.10 pip -y
+conda activate gausstr
+
+pip install setuptools==69.5.1 numpy==1.26.4 opencv-python ninja
+
+pip install torch==2.1.2 torchvision==0.16.2 --index-url https://download.pytorch.org/whl/cu118
+
+pip install openmim==0.3.9
+mim install mmengine==0.10.4
+mim install mmcv==2.1.0
+mim install mmdet==3.2.0
+mim install mmdet3d==1.4.0
+mim install mmpretrain==1.2.0
+mim install mmsegmentation==1.2.2
+
+pip install https://github.com/nerfstudio-project/gsplat/releases/download/v1.4.0/gsplat-1.4.0%2Bpt21cu118-cp310-cp310-linux_x86_64.whl
+
 pip install -r requirements.txt
 ```
 
@@ -40,6 +58,8 @@ If you are not familiar with mmlab series, here is our suggested steps:
 4. Install the rest of requirements.
 
 ### Dataset Preparation
+
+> 按照 `docs/data-preparation.md` 的说明准备数据
 
 1. Download or manually prepare the nuScenes dataset following the instructions in the [mmdetection3d docs](https://mmdetection3d.readthedocs.io/en/latest/user_guides/dataset_prepare.html#nuscenes) and place it in `data/nuscenes`.
    **NOTE:** Please be aware that we are using the latest OpenMMLab V2.0 format. If you've previously prepared the nuScenes dataset from other repositories, it might be outdated. For more information, please refer to [update_infos_to_v2.py](https://github.com/open-mmlab/mmdetection3d/blob/main/tools/dataset_converters/update_infos_to_v2.py).

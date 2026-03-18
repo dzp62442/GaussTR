@@ -1,10 +1,28 @@
-torch
-torchvision
-mmcv
-mmdet
-mmdet3d
-mmpretrain
-mmsegmentation
-openmim
+# Core runtime
+numpy==1.26.4
+torch==2.1.2+cu118
+torchvision==0.16.2+cu118
+openmim==0.3.9
+mmengine==0.10.4
+mmcv==2.1.0
+mmdet==3.3.0
+mmdet3d==1.4.0
+mmpretrain==1.2.0
+mmsegmentation==1.2.2
 ninja
-gsplat
+
+# Project dependencies used directly in this repo
+rich
+nuscenes-devkit
+pyquaternion
+terminaltables
+matplotlib
+pillow
+pandas
+seaborn
+taichi
+timm
+
+# Optional visualization dependency
+vtk==9.3.0
+mayavi==4.8.1
