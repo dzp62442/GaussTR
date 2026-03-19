@@ -40,12 +40,12 @@ INDEX_MAPPING = [
 ]
 
 IMG_PATH = 'data/nuscenes/samples/'
-OUTPUT_DIR = Path('nuscenes_grounded_sam2/')
+OUTPUT_DIR = Path('data/nuscenes_grounded_sam2/')
 
-SAM2_CHECKPOINT = 'checkpoints/sam2.1_hiera_base_plus.pt'
-SAM2_MODEL_CONFIG = 'configs/sam2.1/sam2.1_hiera_b+.yaml'
-GROUNDING_DINO_CONFIG = 'grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py'
-GROUNDING_DINO_CHECKPOINT = 'gdino_checkpoints/groundingdino_swinb_cogcoor.pth'
+SAM2_CHECKPOINT = 'third_party/Grounded-SAM-2/checkpoints/sam2.1_hiera_base_plus.pt'
+SAM2_MODEL_CONFIG = 'third_party/Grounded-SAM-2/configs/sam2.1/sam2.1_hiera_b+.yaml'
+GROUNDING_DINO_CONFIG = 'third_party/Grounded-SAM-2/grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py'
+GROUNDING_DINO_CHECKPOINT = 'third_party/Grounded-SAM-2/gdino_checkpoints/groundingdino_swinb_cogcoor.pth'
 
 BOX_THRESHOLD = 0.35
 TEXT_THRESHOLD = 0.25

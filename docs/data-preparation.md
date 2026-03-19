@@ -161,11 +161,7 @@ data/nuscenes/gts
 
 ## 8.1 生成 Metric3D 深度
 
-两条模型分支都需要。输出目录:
-
-```text
-data/nuscenes_metric3d/
-```
+两条模型分支都需要。输出目录：`data/nuscenes_metric3d/`
 
 从 **GaussTR 仓库根目录** 运行：
 
@@ -194,11 +190,7 @@ PYTHONPATH=. python tools/generate_depth.py
 
 ## 8.2 生成 FeatUp 特征
 
-仅 `GaussTR-FeatUp` 需要。输出目录：
-
-```text
-data/nuscenes_featup/
-```
+仅 `GaussTR-FeatUp` 需要。输出目录：`data/nuscenes_featup/`
 
 先克隆 `FeatUp` 仓库到 `third_party/` 下，再执行**GaussTR 自带的** `tools/generate_featup.py`。从 **GaussTR 根目录** 运行：
 
@@ -228,18 +220,12 @@ PYTHONPATH=. python tools/generate_featup.py
 
 ## 8.3 生成 Grounded-SAM-2 分割伪标签
 
-仅 `GaussTR-FeatUp` 需要。
+仅 `GaussTR-FeatUp` 需要。输出目录 / 配置文件期望读取的是：`data/nuscenes_grounded_sam2/`
 
 README 把它描述成“可选辅助监督”，但要注意：
 
 - 默认提供的 [configs/gausstr_featup.py](/home/dzp62442/Projects/GaussTR/configs/gausstr_featup.py) 会直接读取 `data/nuscenes_grounded_sam2`
 - 如果你不生成这部分数据，就需要同步修改配置，去掉对应的 `LoadFeatMaps(..., key='sem_seg')` 和分割监督
-
-输出目录 / 配置文件期望读取的是：
-
-```text
-data/nuscenes_grounded_sam2/
-```
 
 先克隆 `Grounded-SAM-2` 仓库到 `third_party/` 下：
 
@@ -248,39 +234,33 @@ mkdir -p third_party
 git clone https://github.com/IDEA-Research/Grounded-SAM-2.git third_party/Grounded-SAM-2
 ```
 
-然后按 `Grounded-SAM-2` 官方 README 安装其依赖，并下载下面的两个权重到对应位置：
+按 `Grounded-SAM-2` 官方 README，单独开一个环境安装：
 
-```text
-third_party/Grounded-SAM-2/checkpoints/sam2.1_hiera_base_plus.pt
-third_party/Grounded-SAM-2/gdino_checkpoints/groundingdino_swinb_cogcoor.pth
+```bash
+conda create -n grounded-sam2 python=3.10 -y
+conda activate grounded-sam2
+
+pip install --upgrade pip wheel
+pip install 'setuptools<81'
+pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
+
+pip install -e ./third_party/Grounded-SAM-2
+pip install --no-build-isolation -e ./third_party/Grounded-SAM-2/grounding_dino
 ```
 
-`tools/generate_grounded_sam2.py` 默认不能直接从 `GaussTR` 根目录运行，因为下面 5 个路径是按 `Grounded-SAM-2` 仓库根目录写的：
+然后从终端下载本项目实际需要的两个权重：
 
-- [tools/generate_grounded_sam2.py:42](/home/dzp62442/Projects/GaussTR/tools/generate_grounded_sam2.py#L42)  
-  `IMG_PATH = 'data/nuscenes/samples/'`
-- [tools/generate_grounded_sam2.py:43](/home/dzp62442/Projects/GaussTR/tools/generate_grounded_sam2.py#L43)  
-  `OUTPUT_DIR = Path('nuscenes_grounded_sam2/')`
-- [tools/generate_grounded_sam2.py:45](/home/dzp62442/Projects/GaussTR/tools/generate_grounded_sam2.py#L45)  
-  `SAM2_CHECKPOINT = 'checkpoints/sam2.1_hiera_base_plus.pt'`
-- [tools/generate_grounded_sam2.py:47](/home/dzp62442/Projects/GaussTR/tools/generate_grounded_sam2.py#L47)  
-  `GROUNDING_DINO_CONFIG = 'grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py'`
-- [tools/generate_grounded_sam2.py:48](/home/dzp62442/Projects/GaussTR/tools/generate_grounded_sam2.py#L48)  
-  `GROUNDING_DINO_CHECKPOINT = 'gdino_checkpoints/groundingdino_swinb_cogcoor.pth'`
+```bash
+mkdir -p third_party/Grounded-SAM-2/checkpoints third_party/Grounded-SAM-2/gdino_checkpoints
 
-改成下面这样：
+wget -O third_party/Grounded-SAM-2/checkpoints/sam2.1_hiera_base_plus.pt \
+  https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt
 
-```python
-IMG_PATH = 'data/nuscenes/samples/'
-OUTPUT_DIR = Path('data/nuscenes_grounded_sam2/')
-
-SAM2_CHECKPOINT = 'third_party/Grounded-SAM-2/checkpoints/sam2.1_hiera_base_plus.pt'
-SAM2_MODEL_CONFIG = 'third_party/Grounded-SAM-2/configs/sam2.1/sam2.1_hiera_b+.yaml'
-GROUNDING_DINO_CONFIG = 'third_party/Grounded-SAM-2/grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py'
-GROUNDING_DINO_CHECKPOINT = 'third_party/Grounded-SAM-2/gdino_checkpoints/groundingdino_swinb_cogcoor.pth'
+wget -O third_party/Grounded-SAM-2/gdino_checkpoints/groundingdino_swinb_cogcoor.pth \
+  https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha2/groundingdino_swinb_cogcoor.pth
 ```
 
-改完后，从 **GaussTR 根目录** 运行：
+`tools/generate_grounded_sam2.py` 的路径已改成可直接从 **GaussTR 根目录** 运行。激活 `grounded-sam2` 环境后执行：
 
 ```bash
 PYTHONPATH=./third_party/Grounded-SAM-2 python tools/generate_grounded_sam2.py
