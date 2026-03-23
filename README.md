@@ -95,12 +95,32 @@ Download the pre-generated CLIP text embeddings from the [Releases](https://gith
 
 ```bash
 PYTHONPATH=. mim train mmdet3d [CONFIG] [-l pytorch -G [GPU_NUM]]
+
+# GaussTR-FeatUp, single GPU
+PYTHONPATH=. mim train mmdet3d configs/gausstr_featup.py -G 1
+
+# GaussTR-FeatUp, multi GPU
+PYTHONPATH=. mim train mmdet3d configs/gausstr_featup.py -l pytorch -G 8
+
+# GaussTR-Talk2DINO, single GPU
+PYTHONPATH=. mim train mmdet3d configs/gausstr_talk2dino.py -G 1
+
+# GaussTR-Talk2DINO, multi GPU
+PYTHONPATH=. mim train mmdet3d configs/gausstr_talk2dino.py -l pytorch -G 8
 ```
 
 ### Testing
 
 ```bash
 PYTHONPATH=. mim test mmdet3d [CONFIG] -C [CKPT_PATH] [-l pytorch -G [GPU_NUM]]
+
+# Test author checkpoints, single GPU
+PYTHONPATH=. mim test mmdet3d configs/gausstr_featup.py -C ckpts/gausstr_featup_e24_miou11.70.pth -G 1
+PYTHONPATH=. mim test mmdet3d configs/gausstr_talk2dino.py -C ckpts/gausstr_talk2dino_e20_miou12.27.pth -G 1
+
+# Test your own checkpoints
+PYTHONPATH=. mim test mmdet3d configs/gausstr_featup.py -C work_dirs/gausstr_featup/epoch_24.pth -G 1
+PYTHONPATH=. mim test mmdet3d configs/gausstr_talk2dino.py -C work_dirs/gausstr_talk2dino/epoch_24.pth -G 1
 ```
 
 ### Visualization
