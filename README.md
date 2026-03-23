@@ -47,7 +47,7 @@ mim install mmsegmentation==1.2.2
 
 pip install https://github.com/nerfstudio-project/gsplat/releases/download/v1.4.0/gsplat-1.4.0%2Bpt21cu118-cp310-cp310-linux_x86_64.whl
 
-pip install -r requirements.txt
+pip install -r requirements.txt  --no-build-isolation
 ```
 
 If you are not familiar with mmlab series, here is our suggested steps:
