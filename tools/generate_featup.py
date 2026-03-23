@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 image_dir = 'data/nuscenes/samples/'
 save_dir = 'data/nuscenes_featup/'
+valid_suffixes = {'.jpg', '.jpeg', '.png'}
 
 
 def main():
@@ -20,9 +21,14 @@ def main():
         'mhamilton723/FeatUp', 'maskclip', use_norm=False).to(device)
     upsampler.eval()
     transform = T.Compose([T.Resize((432, 768)), T.ToTensor(), norm])
+    os.makedirs(save_dir, exist_ok=True)
 
-    for view_dir in os.listdir(image_dir):
-        for image_name in tqdm(os.listdir(osp.join(image_dir, view_dir))):
+    for view_dir in sorted(os.listdir(image_dir)):
+        if not view_dir.startswith('CAM_'):
+            continue
+        for image_name in tqdm(sorted(os.listdir(osp.join(image_dir, view_dir)))):
+            if osp.splitext(image_name)[1].lower() not in valid_suffixes:
+                continue
 
             image_path = osp.join(image_dir, view_dir, image_name)
             image = Image.open(image_path).convert('RGB')

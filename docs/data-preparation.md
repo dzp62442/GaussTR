@@ -197,7 +197,7 @@ PYTHONPATH=. python tools/generate_depth.py
 ```bash
 mkdir -p third_party
 git clone https://github.com/mhamilton723/FeatUp.git third_party/FeatUp
-pip install -e ./third_party/FeatUp
+pip install ./third_party/FeatUp --no-build-isolation
 PYTHONPATH=. python tools/generate_featup.py
 ```
 
@@ -243,6 +243,7 @@ conda activate grounded-sam2
 pip install --upgrade pip wheel
 pip install 'setuptools<81'
 pip install torch==2.3.1 torchvision==0.18.1 torchaudio==2.3.1 --index-url https://download.pytorch.org/whl/cu118
+pip install transformers==4.33.2 tokenizers==0.13.3 opencv-python supervision timm addict yapf pycocotools
 
 pip install -e ./third_party/Grounded-SAM-2
 pip install --no-build-isolation -e ./third_party/Grounded-SAM-2/grounding_dino

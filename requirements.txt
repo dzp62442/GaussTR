@@ -22,6 +22,7 @@ pandas
 seaborn
 taichi
 timm
+ftfy
 
 # Optional visualization dependency
 vtk==9.3.0

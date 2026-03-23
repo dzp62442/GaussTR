@@ -43,7 +43,7 @@ IMG_PATH = 'data/nuscenes/samples/'
 OUTPUT_DIR = Path('data/nuscenes_grounded_sam2/')
 
 SAM2_CHECKPOINT = 'third_party/Grounded-SAM-2/checkpoints/sam2.1_hiera_base_plus.pt'
-SAM2_MODEL_CONFIG = 'third_party/Grounded-SAM-2/configs/sam2.1/sam2.1_hiera_b+.yaml'
+SAM2_MODEL_CONFIG = 'configs/sam2.1/sam2.1_hiera_b+.yaml'
 GROUNDING_DINO_CONFIG = 'third_party/Grounded-SAM-2/grounding_dino/groundingdino/config/GroundingDINO_SwinB_cfg.py'
 GROUNDING_DINO_CHECKPOINT = 'third_party/Grounded-SAM-2/gdino_checkpoints/groundingdino_swinb_cogcoor.pth'
 
@@ -51,6 +51,7 @@ BOX_THRESHOLD = 0.35
 TEXT_THRESHOLD = 0.25
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 DUMP_JSON_RESULTS = True
+VALID_SUFFIXES = {'.jpg', '.jpeg', '.png'}
 
 # create output directory
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -71,8 +72,12 @@ grounding_model = load_model(
 # VERY important: text queries need to be lowercased + end with a dot
 text = TEXT_PROMPT
 
-for view_dir in os.listdir(IMG_PATH):
-    for image_path in tqdm(os.listdir(osp.join(IMG_PATH, view_dir))):
+for view_dir in sorted(os.listdir(IMG_PATH)):
+    if not view_dir.startswith('CAM_'):
+        continue
+    for image_path in tqdm(sorted(os.listdir(osp.join(IMG_PATH, view_dir)))):
+        if osp.splitext(image_path)[1].lower() not in VALID_SUFFIXES:
+            continue
         image_source, image = load_image(
             os.path.join(IMG_PATH, view_dir, image_path))
 
@@ -92,28 +97,25 @@ for view_dir in os.listdir(IMG_PATH):
         input_boxes = box_convert(
             boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
 
-        # FIXME: figure how does this influence the G-DINO model
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
-
         if torch.cuda.get_device_properties(0).major >= 8:
             # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
+        results = np.zeros(image_source.shape[:2], dtype=np.uint8)
         if input_boxes.shape[0] != 0:
-            masks, scores, logits = sam2_predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=input_boxes,
-                multimask_output=False,
-            )
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                masks, scores, logits = sam2_predictor.predict(
+                    point_coords=None,
+                    point_labels=None,
+                    box=input_boxes,
+                    multimask_output=False,
+                )
 
             # convert the shape to (n, H, W)
             if masks.ndim == 4:
                 masks = masks.squeeze(1)
 
-        results = np.zeros_like(masks[0])
-        if input_boxes.shape[0] != 0:
             for i in range(len(labels)):
                 if labels[i] not in CLASSES:
                     continue
