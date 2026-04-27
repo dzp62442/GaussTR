@@ -2,6 +2,18 @@ _base_ = 'mmdet3d::_base_/default_runtime.py'
 
 custom_imports = dict(imports=['gausstr'])
 
+custom_hooks = [
+    dict(type='AutoResumeHook'),
+]
+
+default_hooks = dict(
+    checkpoint=dict(
+        type='CheckpointHook',
+        interval=1,
+        save_optimizer=True,
+        save_param_scheduler=True,
+        save_last=True))
+
 input_size = (504, 896)
 embed_dims = 256
 feat_dims = 768
