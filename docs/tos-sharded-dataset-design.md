@@ -745,6 +745,39 @@ num_views
 
 模型侧 `GaussTR.prepare_inputs()` 不应关心数据来自原始小文件还是 shard。
 
+### 11.1 训练与评估适配
+
+sharded config 同时覆盖训练和验证：
+
+```text
+train_dataloader -> data/gausstr_shards/train
+val_dataloader   -> data/gausstr_shards/val
+test_dataloader  -> val_dataloader
+```
+
+原始 config 中 `train_cfg.val_interval=1`，每个 epoch 后的 eval 使用 `val_dataloader`。`test_dataloader = val_dataloader`，因此当前项目没有单独的 test split 流程；除非显式改配置，test 入口也会评估 val shard。
+
+训练 split 默认准备：
+
+```text
+raw_nuscenes + depth_metric3d + feats_featup + sem_seg_grounded_sam2
+```
+
+val split 默认额外准备：
+
+```text
+occ_gt
+```
+
+因为评估 pipeline 需要 `gt_semantic_seg`、`mask_camera` 等占据真值。正式使用时至少需要分别构建：
+
+```bash
+PYTHONPATH=. python tools/build_sharded_dataset.py --split train --ratio 1
+PYTHONPATH=. python tools/build_sharded_dataset.py --split val --ratio 1
+```
+
+如果只构建了 train shard，训练可以开始，但到 epoch 结束进入 val 时会因为缺少 `data/gausstr_shards/val/index.json` 或 `occ_gt` shard 失败。
+
 ## 12. 第一版实现边界
 
 第一版只实现：
@@ -758,6 +791,7 @@ num_views
 - lazy LRU 内存 cache。
 - DataLoader worker 内 shard 预取。
 - 单机多卡 `ShardAwareSampler`。
+- train/val/test 配置层同步接入 sharded dataloader，其中 test 默认复用 val。
 - dataloader debug 日志和 `torch.load` 短暂文件系统错误重试。
 
 暂不实现：
