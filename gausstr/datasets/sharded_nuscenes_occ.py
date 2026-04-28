@@ -19,8 +19,11 @@ class NuScenesOccShardedDataset(BaseDataset):
                  shard_root='data/gausstr_shards',
                  split='train',
                  required_groups: Optional[Dict[str, Optional[str]]] = None,
-                 preload_mode='all',
+                 preload_mode='lazy',
                  require_success=True,
+                 max_cache_bytes=32 * 1024**3,
+                 prefetch_shards=1,
+                 prefetch_workers=1,
                  metainfo=None,
                  pipeline=None,
                  test_mode=False,
@@ -44,6 +47,9 @@ class NuScenesOccShardedDataset(BaseDataset):
             sem_seg='sem_seg_grounded_sam2')
         self.preload_mode = preload_mode
         self.require_success = require_success
+        self.max_cache_bytes = int(max_cache_bytes)
+        self.prefetch_shards = int(prefetch_shards)
+        self.prefetch_workers = int(prefetch_workers)
         self.store: Optional[ShardMemoryStore] = None
         for legacy_key in ('ann_file', 'data_root', 'data_prefix', 'modality',
                            'filter_empty_gt'):
@@ -68,7 +74,11 @@ class NuScenesOccShardedDataset(BaseDataset):
             self.split,
             groups,
             preload_mode=self.preload_mode,
-            require_success=self.require_success)
+            require_success=self.require_success,
+            max_cache_bytes=self.max_cache_bytes,
+            prefetch_shards=self.prefetch_shards,
+            prefetch_workers=self.prefetch_workers,
+            raw_group=self.required_groups.get('raw', 'raw_nuscenes'))
         return [dict(item) for item in self.store.samples]
 
     def get_data_info(self, idx: int) -> dict:

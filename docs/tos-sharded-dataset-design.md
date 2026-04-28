@@ -318,38 +318,96 @@ raw_nuscenes 用 raw target，默认约 100MB
 
 ### 8.1 设计取舍
 
-当前已经构建出的 shard 是 1% 数据集，四个训练 group 合计约 18GB。训练服务器内存非常充足，本地硬盘空间反而紧张，因此第一版 dataloader 采用 **内存优先** 策略：
+1% shard 只是为了降低预处理验证成本，最终目标是全量 train。全量数据中仅 `depth_metric3d` 就可能接近 1TB，单卡配套约 240GB 内存，且 DDP 下通常每张卡一个训练进程，因此 **不能把所有 shard 全部读入内存**。
 
-```text
-TOS mount path -> torch.load(all required shards) -> process memory -> training
-```
-
-不实现、不启用本地硬盘 cache。只要进程内存够，训练期间不应再触发 TOS shard 读取，从而最大限度避免 GPU 等待数据。
-
-第一版默认：
-
-```text
-preload_mode = "all"
-```
-
-含义是 dataset 初始化时把配置需要的所有 group shard 全量读入内存，并建立：
-
-```python
-group -> sample_idx -> sample_payload
-```
-
-这样 `__getitem__` 不再读文件，只做内存查表、图像解码、特征取出和数据增强。
-
-后续如果处理全量数据后发现单进程全量预加载不合适，再增加：
+正式训练默认采用：
 
 ```text
 preload_mode = "lazy"
-prefetch_shards = 1 or 2
 ```
 
-lazy 模式仍然只从 TOS mount 直接 `torch.load()`，不落本地磁盘。
+主路径是：
 
-### 8.2 与 pixelSplat 的关系
+```text
+TOS mount path -> torch.load(required shard) -> per-process memory LRU -> sample assemble
+```
+
+仍然不实现、不启用本地硬盘 cache。原因：
+
+- TOS 已挂载为本地路径，大文件顺序读取速度可接受。
+- 本地硬盘空间紧张，额外 cache 会引入容量和一致性问题。
+- 内存充足，应该把可用资源用于 shard 级内存 LRU 和后台预取。
+
+`preload_mode="all"` 只保留为 1% 小数据调试选项，不作为全量训练默认值。
+
+### 8.2 内存 LRU
+
+lazy 模式下，`ShardMemoryStore` 维护进程内 LRU cache：
+
+```text
+cache key = (group, shard_id)
+cache value = torch.load(...) 后的 shard payload
+```
+
+每次 `store.get(group, sample_idx)`：
+
+```text
+1. 查 index: sample_idx -> group -> shard_id/offset
+2. 如果 shard 在内存，直接返回 payload["samples"][offset]
+3. 如果 shard 不在内存，从 TOS mount 路径 torch.load()
+4. 加入 LRU，必要时逐出最久未访问 shard
+```
+
+cache 预算按进程设置：
+
+```text
+max_cache_bytes = 24GB 到 64GB per DataLoader worker process
+```
+
+实际值需要结合 GPU 数量调整：
+
+```text
+1 GPU, 4 workers: 32GB/worker -> 128GB shard cache budget
+4 GPU, 4 workers/rank: 32GB/worker -> 512GB shard cache budget
+8 GPU, 4 workers/rank: 24GB-32GB/worker -> 768GB-1024GB shard cache budget
+```
+
+这个 cache 是内存 cache，不落盘。
+
+### 8.3 后台预取
+
+为了减少 GPU 等数据，lazy 模式需要两层预取。
+
+第一层依赖 PyTorch DataLoader：
+
+```text
+num_workers > 0
+prefetch_factor = 2 or 4
+persistent_workers = True
+pin_memory = True
+```
+
+第二层是 `ShardMemoryStore` 的后台 shard 预取：
+
+```text
+当前 sample 访问了 raw_nuscenes/000123
+根据 raw shard 覆盖的 global offset 区间
+找到下一段 raw shard 以及其覆盖的 depth/feat/sem shards
+后台线程提前 torch.load 这些 shard 到 LRU
+```
+
+因为 group shard 边界按 `base_block_size` 对齐，一个 raw shard 覆盖的 offsets 可以稳定映射到若干 depth/feat/sem shard。预取不影响正确性，最多影响命中率。
+
+推荐默认：
+
+```text
+prefetch_shards = 1
+prefetch_workers = 1
+```
+
+含义是访问当前 raw shard 时，后台预取下一个 raw shard 及其覆盖的 required group shards。预取线程只读 TOS mount，不写本地盘。
+
+### 8.4 与 pixelSplat 的关系
 
 pixelSplat 的 `DatasetRE10k` 是 `IterableDataset`：训练时收集 `.torch` chunks，shuffle chunk，`torch.load(chunk)` 后再 shuffle chunk 内样本。这个思路说明 chunk 级大文件读取是有效的，但 GaussTR 不能完全照搬：
 
@@ -357,14 +415,14 @@ pixelSplat 的 `DatasetRE10k` 是 `IterableDataset`：训练时收集 `.torch` c
 - GaussTR 一个样本分布在 `raw_nuscenes`、`depth_metric3d`、`feats_featup`、`sem_seg_grounded_sam2` 等多个 group。
 - pixelSplat 训练阶段没有严格按 worker 拆 chunk；GaussTR 若用 IterableDataset，必须额外处理 DDP rank/worker 分片，避免重复样本。
 
-因此第一版选择更容易接入 MMEngine/MMDet3D 的 map-style dataset：
+因此本项目选择更容易接入 MMEngine/MMDet3D 的 map-style dataset：
 
 ```text
 DefaultSampler/DistributedSampler 负责 sample shuffle 和 rank 分片
-NuScenesOccShardedDataset 负责从内存中的 shard payload 组装样本
+NuScenesOccShardedDataset 负责从 shard store 组装样本
 ```
 
-### 8.3 数据集类
+### 8.5 数据集类
 
 新增：
 
@@ -377,8 +435,8 @@ gausstr/datasets/sharded_nuscenes_occ.py
 
 1. 读取 `{shard_root}/{split}/index.json`。
 2. 读取需要的 group manifest。
-3. `preload_mode="all"` 时，加载所有需要的 `.torch` shard。
-4. 建立 `sample_idx -> group payload` 内存索引。
+3. `preload_mode="lazy"` 时，只在样本访问时加载需要的 shard。
+4. `preload_mode="all"` 时，加载所有需要的 `.torch` shard，仅用于小数据调试。
 5. `get_data_info(index)` 返回一个与原 `NuScenesOccDataset` pipeline 兼容的 results dict。
 
 `ShardMemoryStore` 核心接口：
@@ -390,9 +448,9 @@ store.get("feats_featup", sample_idx)
 store.get("sem_seg_grounded_sam2", sample_idx)
 ```
 
-`preload_mode="all"` 下，`get()` 是纯内存查表。
+`preload_mode="lazy"` 下，`get()` 通过 LRU cache 避免重复加载同一个 shard。
 
-### 8.4 sharded transforms
+### 8.6 sharded transforms
 
 新增 transform：
 
@@ -449,10 +507,11 @@ num_views
 
 区别只是图像 bytes 来自 `raw_nuscenes` shard，而不是 `mmengine.fileio.get(img_path)`。
 
-### 8.5 DataLoader 参数
+### 8.7 DataLoader 参数
 
-因为 shard 已全量进入内存，训练时主要开销变成：
+lazy 模式下，训练期主要开销包括：
 
+- shard cache miss 时的 `torch.load`
 - JPEG decode
 - numpy/tensor 组装
 - ImageAug3D
@@ -472,35 +531,17 @@ train_dataloader = dict(
         type='NuScenesOccShardedDataset',
         shard_root='data/gausstr_shards',
         split='train',
-        preload_mode='all',
+        preload_mode='lazy',
+        max_cache_bytes=32 * 1024**3,
+        prefetch_shards=1,
         required_groups=dict(
             raw='raw_nuscenes',
             depth='depth_metric3d',
             feats='feats_featup',
-            sem_seg='sem_seg_grounded_sam2')))
+	    sem_seg='sem_seg_grounded_sam2')))
 ```
 
-当前 1% shard 可以全量读取。若单进程内存和 fork worker 的复制开销仍然可接受，再把 `num_workers` 增到 8 或 16。
-
-### 8.6 预取策略
-
-当前默认 `preload_mode="all"` 时，**没有下一个 shard 需要在训练中预取**：所有 shard 已经在训练开始前进入内存。GPU 等数据的问题主要交给 PyTorch DataLoader 的 worker 预取解决：
-
-```text
-num_workers > 0
-prefetch_factor = 2 or 4
-persistent_workers = True
-pin_memory = True
-```
-
-如果未来启用 `preload_mode="lazy"`，再实现后台线程预取：
-
-```text
-当前 sample 所在 raw shard 正在消费
-后台预取下一个 raw shard 覆盖区间内需要的 depth/feat/sem shards
-```
-
-但该模式仍然是内存 cache，不写本地磁盘。
+对于 1% 调试数据，可以临时把 `preload_mode` 改为 `all`；全量训练配置不应使用 `all`。
 
 ## 9. 预处理脚本接口
 

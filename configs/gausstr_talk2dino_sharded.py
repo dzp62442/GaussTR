@@ -41,7 +41,10 @@ train_dataloader = dict(
         type='NuScenesOccShardedDataset',
         shard_root='data/gausstr_shards',
         split='train',
-        preload_mode='all',
+        preload_mode='lazy',
+        max_cache_bytes=32 * 1024**3,
+        prefetch_shards=1,
+        prefetch_workers=1,
         serialize_data=False,
         required_groups=dict(raw='raw_nuscenes', depth='depth_metric3d'),
         pipeline=train_pipeline))

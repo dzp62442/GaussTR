@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import hashlib
 import json
 import math
@@ -36,6 +37,12 @@ CAMERA_ORDER = (
 
 GROUP_KINDS = {'raw', 'depth', 'feats', 'sem_seg', 'occ_gt'}
 DERIVED_KINDS = {'depth', 'feats', 'sem_seg'}
+RETRYABLE_FS_ERRNOS = {
+    errno.EAGAIN,
+    errno.EBUSY,
+    errno.EINTR,
+    getattr(errno, 'ESTALE', 116),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -129,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--num-workers',
         type=int,
-        default=4,
+        default=2,
         help='Number of shard build workers per group. Use 1 for serial processing.')
     parser.add_argument(
         '--depth-root',
@@ -448,6 +455,35 @@ def file_sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
                 break
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def replace_with_retry(src: Path,
+                       dst: Path,
+                       retries: int = 20,
+                       base_delay: float = 0.2) -> None:
+    for attempt in range(retries + 1):
+        try:
+            src.replace(dst)
+            return
+        except OSError as exc:
+            if exc.errno not in RETRYABLE_FS_ERRNOS or attempt >= retries:
+                raise
+            time.sleep(min(base_delay * (1.5**attempt), 5.0))
+
+
+def unlink_with_retry(path: Path,
+                      retries: int = 20,
+                      base_delay: float = 0.2) -> None:
+    for attempt in range(retries + 1):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            if exc.errno not in RETRYABLE_FS_ERRNOS or attempt >= retries:
+                raise
+            time.sleep(min(base_delay * (1.5**attempt), 5.0))
 
 
 def percentile(values: Sequence[int], q: float) -> int:
@@ -816,6 +852,9 @@ def torch_save_atomic(path: Path,
                       compute_sha256: bool) -> Dict[str, Any]:
     success_path = path.with_suffix('.SUCCESS')
     sha_path = path.with_suffix(path.suffix + '.sha256')
+    tmp_path = path.with_suffix(path.suffix + '.tmp')
+    success_tmp = path.with_suffix('.SUCCESS.tmp')
+    sha_tmp = path.with_suffix(path.suffix + '.sha256.tmp')
     if path.exists() and success_path.exists() and not overwrite:
         return {
             'path': str(path),
@@ -824,15 +863,15 @@ def torch_save_atomic(path: Path,
             'skipped': True,
         }
     if path.exists() and not overwrite:
-        raise FileExistsError(f'{path} already exists. Pass --overwrite.')
+        print(f'Removing incomplete shard without SUCCESS marker: {path}')
+        for stale in (path, sha_path, tmp_path, success_tmp, sha_tmp):
+            if stale.exists():
+                unlink_with_retry(stale)
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + '.tmp')
-    success_tmp = path.with_suffix('.SUCCESS.tmp')
-    sha_tmp = path.with_suffix(path.suffix + '.sha256.tmp')
     for stale in (tmp_path, success_tmp, sha_tmp):
         if stale.exists():
-            stale.unlink()
+            unlink_with_retry(stale)
 
     torch.save(payload, tmp_path)
     if sanity_load:
@@ -845,11 +884,11 @@ def torch_save_atomic(path: Path,
         digest = file_sha256(tmp_path)
         sha_tmp.write_text(digest + '\n', encoding='utf-8')
 
-    tmp_path.replace(path)
+    replace_with_retry(tmp_path, path)
     if digest is not None:
-        sha_tmp.replace(sha_path)
+        replace_with_retry(sha_tmp, sha_path)
     elif overwrite and sha_path.exists():
-        sha_path.unlink()
+        unlink_with_retry(sha_path)
     success_tmp.write_text(
         json.dumps({
             'path': str(path),
@@ -859,7 +898,7 @@ def torch_save_atomic(path: Path,
         },
                    sort_keys=True) + '\n',
         encoding='utf-8')
-    success_tmp.replace(success_path)
+    replace_with_retry(success_tmp, success_path)
     return {
         'path': str(path),
         'bytes': path.stat().st_size,
