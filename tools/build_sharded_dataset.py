@@ -279,7 +279,7 @@ def dump_json(path: Path, data: Mapping[str, Any], overwrite: bool) -> None:
     with tmp_path.open('w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write('\n')
-    tmp_path.replace(path)
+    replace_with_retry(tmp_path, path)
 
 
 def dump_json_or_skip_existing(path: Path, data: Mapping[str, Any],
@@ -305,7 +305,7 @@ def dump_json_replace_existing(path: Path, data: Mapping[str, Any]) -> None:
     with tmp_path.open('w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, sort_keys=True)
         f.write('\n')
-    tmp_path.replace(path)
+    replace_with_retry(tmp_path, path)
 
 
 def load_json_if_exists(path: Path) -> Optional[Dict[str, Any]]:
@@ -1183,7 +1183,7 @@ def write_build_success(split_root: Path, summary: Mapping[str, Any]) -> None:
     with success_tmp.open('w', encoding='utf-8') as f:
         json.dump(payload, f, indent=2, sort_keys=True)
         f.write('\n')
-    success_tmp.replace(success_path)
+    replace_with_retry(success_tmp, success_path)
 
 
 def validate_sharded_output(
@@ -1300,7 +1300,7 @@ def copy_ann_subset(args: argparse.Namespace, ann_data: Mapping[str, Any],
     tmp_path = path.with_suffix(path.suffix + '.tmp')
     with tmp_path.open('wb') as f:
         pickle.dump(subset, f, protocol=pickle.HIGHEST_PROTOCOL)
-    tmp_path.replace(path)
+    replace_with_retry(tmp_path, path)
 
 
 def write_sample_manifest_json(args: argparse.Namespace,
