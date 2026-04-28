@@ -43,6 +43,11 @@ RETRYABLE_FS_ERRNOS = {
     errno.EINTR,
     getattr(errno, 'ESTALE', 116),
 }
+RETRYABLE_TORCH_LOAD_MESSAGES = (
+    'PytorchStreamReader failed reading zip archive',
+    'failed finding central directory',
+    'failed locating file',
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -222,7 +227,36 @@ def load_pickle(path: Path) -> Any:
             return pickle.load(f)
 
 
-def torch_load(path: Path) -> Any:
+def is_retryable_torch_load_error(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and any(
+        message in str(exc) for message in RETRYABLE_TORCH_LOAD_MESSAGES)
+
+
+def torch_load(path: Path,
+               retries: int = 0,
+               base_delay: float = 0.5) -> Any:
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            return torch_load_once(path)
+        except OSError as exc:
+            if exc.errno not in RETRYABLE_FS_ERRNOS or attempt >= retries:
+                raise
+            last_exc = exc
+        except RuntimeError as exc:
+            if not is_retryable_torch_load_error(exc) or attempt >= retries:
+                raise
+            last_exc = exc
+        delay = min(base_delay * (1.5**attempt), 5.0)
+        print(
+            f'Retrying torch.load for {path} '
+            f'({attempt + 1}/{retries}) after {last_exc!r}; '
+            f'sleep={delay:.1f}s')
+        time.sleep(delay)
+    raise RuntimeError(f'Unreachable torch_load retry state for {path}')
+
+
+def torch_load_once(path: Path) -> Any:
     try:
         return torch.load(path, map_location='cpu', weights_only=False)
     except TypeError:
@@ -875,7 +909,7 @@ def torch_save_atomic(path: Path,
 
     torch.save(payload, tmp_path)
     if sanity_load:
-        loaded = torch_load(tmp_path)
+        loaded = torch_load(tmp_path, retries=20, base_delay=0.5)
         if loaded.get('sample_idx') != payload.get('sample_idx'):
             raise RuntimeError(f'Sanity load sample_idx mismatch: {tmp_path}')
 

@@ -308,11 +308,14 @@ raw_nuscenes 用 raw target，默认约 100MB
 
 训练阶段：
 
-- 每个 epoch 对 `sample_order` 重新 shuffle。
-- DDP 单机多卡用 `rank/world_size` 对 sample 序列切分。
+- 每个 epoch 由 `ShardAwareSampler` shuffle raw shard 顺序。
+- 每个 raw shard 内部再按 epoch seed shuffle 样本顺序。
+- DDP 单机多卡按 raw shard 分配给各 rank，避免不同 rank 频繁竞争同一批 shard。
+- 每个 rank 的 epoch 长度按“最多 raw shard 数 * 最大 raw shard 样本数”估算；短 rank 只补样本，不截断长 rank 已持有的 shard 样本。
+- 如果小比例调试集的 raw shard 数少于 GPU 数，空 rank 会复用一个 raw shard，以保证 DDP 每个 rank 都有数据；全量训练 raw shard 数远大于 GPU 数时不会触发这个退化路径。
 - dataloader 根据 sample_id 查各 group 的 shard/offset。
 
-因此，即使某个 batch 中样本来自多个 group 的不同 shard，也不会破坏训练随机性。
+因此，训练随机性来自 epoch 级 shard shuffle 和 shard 内 sample shuffle；预处理时的 `sample_order` 只提供稳定全局索引，不要求 dataloader 再做完全 sample-level 随机访问。
 
 ## 8. dataloader 设计
 
@@ -358,21 +361,21 @@ cache value = torch.load(...) 后的 shard payload
 4. 加入 LRU，必要时逐出最久未访问 shard
 ```
 
-cache 预算按进程设置：
+cache 预算按 DataLoader worker 进程设置：
 
 ```text
-max_cache_bytes = 24GB 到 64GB per DataLoader worker process
+max_cache_bytes = 24GB per DataLoader worker process
 ```
 
-实际值需要结合 GPU 数量调整：
+当前 sharded 训练配置默认 `num_workers=8`，因此理论上限是：
 
 ```text
-1 GPU, 4 workers: 32GB/worker -> 128GB shard cache budget
-4 GPU, 4 workers/rank: 32GB/worker -> 512GB shard cache budget
-8 GPU, 4 workers/rank: 24GB-32GB/worker -> 768GB-1024GB shard cache budget
+1 GPU, 8 workers: 24GB/worker -> 192GB shard cache budget
+4 GPU, 8 workers/rank: 24GB/worker -> 768GB shard cache budget
+8 GPU, 8 workers/rank: 24GB/worker -> 1536GB shard cache budget
 ```
 
-这个 cache 是内存 cache，不落盘。
+这是上限，不是启动时立即占用；实际占用取决于每个 worker 当前访问过的 shard 和 LRU 逐出。这个 cache 是内存 cache，不落盘。
 
 ### 8.3 后台预取
 
@@ -418,7 +421,7 @@ pixelSplat 的 `DatasetRE10k` 是 `IterableDataset`：训练时收集 `.torch` c
 因此本项目选择更容易接入 MMEngine/MMDet3D 的 map-style dataset：
 
 ```text
-DefaultSampler/DistributedSampler 负责 sample shuffle 和 rank 分片
+ShardAwareSampler 负责 raw shard shuffle、shard 内 sample shuffle 和 rank 分片
 NuScenesOccShardedDataset 负责从 shard store 组装样本
 ```
 
@@ -522,26 +525,49 @@ lazy 模式下，训练期主要开销包括：
 ```python
 train_dataloader = dict(
     batch_size=1,
-    num_workers=4,
+    num_workers=8,
     persistent_workers=True,
     pin_memory=True,
     prefetch_factor=2,
-    sampler=dict(type='DefaultSampler', shuffle=True),
+    sampler=dict(type='ShardAwareSampler', shuffle=True, num_workers=8),
     dataset=dict(
         type='NuScenesOccShardedDataset',
         shard_root='data/gausstr_shards',
         split='train',
         preload_mode='lazy',
-        max_cache_bytes=32 * 1024**3,
+        max_cache_bytes=24 * 1024**3,
         prefetch_shards=1,
+        prefetch_workers=1,
+        debug=False,
+        debug_interval=100,
         required_groups=dict(
             raw='raw_nuscenes',
             depth='depth_metric3d',
             feats='feats_featup',
-	    sem_seg='sem_seg_grounded_sam2')))
+            sem_seg='sem_seg_grounded_sam2')))
 ```
 
 对于 1% 调试数据，可以临时把 `preload_mode` 改为 `all`；全量训练配置不应使用 `all`。
+
+### 8.8 调试日志与容错
+
+`NuScenesOccShardedDataset` 支持 debug 开关：
+
+```python
+dataset=dict(
+    type='NuScenesOccShardedDataset',
+    debug=True,
+    debug_interval=20)
+```
+
+开启后，每个 DataLoader worker 会打印：
+
+- shard load start/done、路径、样本数、耗时和 cache bytes。
+- cache hit/miss、shard load、prefetch scheduled/wait/hit、eviction 统计。
+- 预取线程的 start/done。
+- TOS/mount 路径出现短暂 `EAGAIN/EBUSY/EINTR/ESTALE` 时的 `torch.load` 重试。
+
+debug 日志可能很密，正式训练默认关闭；只在定位数据等待、cache 过小、TOS 抖动或 shard 损坏时打开。
 
 ## 9. 预处理脚本接口
 
@@ -648,7 +674,11 @@ occ_gt
 按 group 顺序处理，同一个 group 内用线程池并行写 shard：
 
 ```text
-000000.torch.tmp -> sanity torch.load -> sha256 -> rename -> .SUCCESS
+000000.torch.tmp
+  -> sanity torch.load with retry
+  -> sha256
+  -> atomic rename
+  -> .SUCCESS
 ```
 
 每个 group 写：
@@ -658,6 +688,8 @@ group_manifest.json
 ```
 
 如果用户中断后重跑，已存在且有 `.SUCCESS` 的 shard 会跳过。
+
+TOS/FUSE 挂载路径上，`torch.save()` 返回后立刻 `torch.load()` 可能短暂读到未完全可见的 zip central directory。脚本会对这类 sanity-load 错误重试；如果重试后仍失败，不写 `.SUCCESS`，下次重跑会把不完整 shard 当作未完成文件重建。
 
 ## 11. 与当前 pipeline 的关系
 
@@ -701,11 +733,14 @@ num_views
 - group 独立 shard size，但按 base block 对齐。
 - TOS 挂载路径 direct `torch.load()`。
 - 中断后跳过已完成 shard。
+- lazy LRU 内存 cache。
+- DataLoader worker 内 shard 预取。
+- 单机多卡 `ShardAwareSampler`。
+- dataloader debug 日志和 `torch.load` 短暂文件系统错误重试。
 
 暂不实现：
 
 - 自动 dtype 压缩。
 - 本地硬盘 cache。
-- 异步预取。
 - 多机 shard 分配协议。
 - 多方法自动 fallback。

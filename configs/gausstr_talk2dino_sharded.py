@@ -31,20 +31,22 @@ train_pipeline = [
 
 train_dataloader = dict(
     batch_size=1,
-    num_workers=4,
+    num_workers=8,
     persistent_workers=True,
     pin_memory=True,
     prefetch_factor=2,
-    sampler=dict(type='DefaultSampler', shuffle=True),
+    sampler=dict(type='ShardAwareSampler', shuffle=True, num_workers=8),
     dataset=dict(
         _delete_=True,
         type='NuScenesOccShardedDataset',
         shard_root='data/gausstr_shards',
         split='train',
         preload_mode='lazy',
-        max_cache_bytes=32 * 1024**3,
+        max_cache_bytes=24 * 1024**3,
         prefetch_shards=1,
         prefetch_workers=1,
+        debug=False,
+        debug_interval=100,
         serialize_data=False,
         required_groups=dict(raw='raw_nuscenes', depth='depth_metric3d'),
         pipeline=train_pipeline))
