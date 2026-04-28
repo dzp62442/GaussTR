@@ -1,5 +1,9 @@
 _base_ = './gausstr_featup.py'
 
+log_processor = dict(window_size=50, by_epoch=True)
+
+default_hooks = dict(logger=dict(type='LoggerHook', interval=50))
+
 train_pipeline = [
     dict(
         type='BEVLoadMultiViewImageFromShards',
@@ -76,11 +80,15 @@ val_pipeline = [
 
 train_dataloader = dict(
     batch_size=1,
-    num_workers=8,
+    num_workers=4,
     persistent_workers=True,
     pin_memory=True,
-    prefetch_factor=2,
-    sampler=dict(type='ShardAwareSampler', shuffle=True, num_workers=8),
+    prefetch_factor=1,
+    sampler=dict(
+        type='ShardAwareSampler',
+        shuffle=True,
+        num_workers=4,
+        prefetch_shards=1),
     dataset=dict(
         _delete_=True,
         type='NuScenesOccShardedDataset',
@@ -93,6 +101,7 @@ train_dataloader = dict(
         prefetch_workers=1,
         debug=False,
         debug_interval=100,
+        slow_log_threshold=0.0,
         serialize_data=False,
         required_groups=dict(
             raw='raw_nuscenes',
@@ -103,9 +112,10 @@ train_dataloader = dict(
 
 val_dataloader = dict(
     batch_size=1,
-    num_workers=8,
+    num_workers=1,
     persistent_workers=True,
     pin_memory=True,
+    prefetch_factor=1,
     drop_last=False,
     sampler=dict(type='DefaultSampler', shuffle=False),
     dataset=dict(
@@ -120,6 +130,7 @@ val_dataloader = dict(
         prefetch_workers=1,
         debug=False,
         debug_interval=100,
+        slow_log_threshold=0.0,
         serialize_data=False,
         required_groups=dict(
             raw='raw_nuscenes',

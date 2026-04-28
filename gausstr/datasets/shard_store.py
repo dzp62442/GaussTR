@@ -64,6 +64,7 @@ class ShardMemoryStore:
                  raw_shard_order: Optional[Sequence[str]] = None,
                  debug: bool = False,
                  debug_interval: int = 100,
+                 slow_log_threshold: float = 0.0,
                  torch_load_retries: int = 3,
                  torch_load_retry_wait: float = 1.0) -> None:
         self.shard_root = Path(shard_root)
@@ -78,6 +79,7 @@ class ShardMemoryStore:
         self.raw_shard_order = list(raw_shard_order) if raw_shard_order else None
         self.debug = bool(debug)
         self.debug_interval = max(1, int(debug_interval))
+        self.slow_log_threshold = max(0.0, float(slow_log_threshold))
         self.torch_load_retries = max(0, int(torch_load_retries))
         self.torch_load_retry_wait = max(0.0, float(torch_load_retry_wait))
         self.debug_prefix = (
@@ -132,6 +134,10 @@ class ShardMemoryStore:
 
     def _debug(self, message: str) -> None:
         if self.debug:
+            print(f'{self.debug_prefix} {message}', flush=True)
+
+    def _slow_log(self, message: str) -> None:
+        if self.slow_log_threshold > 0:
             print(f'{self.debug_prefix} {message}', flush=True)
 
     def _debug_stats(self) -> None:
@@ -207,6 +213,13 @@ class ShardMemoryStore:
             f'load done group={group} shard={shard_id} '
             f'samples={len(payload["samples"])} elapsed={elapsed:.2f}s '
             f'cache_bytes={self.current_cache_bytes}/{self.max_cache_bytes}')
+        if elapsed >= self.slow_log_threshold > 0:
+            self._slow_log(
+                f'slow load group={group} shard={shard_id} '
+                f'bytes={shard_bytes} samples={len(payload["samples"])} '
+                f'elapsed={elapsed:.2f}s '
+                f'cache_bytes={self.current_cache_bytes}/{self.max_cache_bytes} '
+                f'path={path}')
         return payload
 
     def _wait_for_prefetch(self, group: str, shard_id: str) -> bool:
@@ -217,8 +230,14 @@ class ShardMemoryStore:
             return False
         self.stats['prefetch_waits'] += 1
         self._debug(f'prefetch wait group={group} shard={shard_id}')
+        started_at = time.monotonic()
         future.result()
+        elapsed = time.monotonic() - started_at
         self.stats['prefetch_hits'] += 1
+        if elapsed >= self.slow_log_threshold > 0:
+            self._slow_log(
+                f'slow prefetch wait group={group} shard={shard_id} '
+                f'elapsed={elapsed:.2f}s')
         return True
 
     def _evict_if_needed(self, protected=None) -> None:
@@ -250,7 +269,10 @@ class ShardMemoryStore:
             for shard_id in sorted(self.group_manifests[group]['shards']):
                 self._load_shard(group, shard_id)
 
-    def get(self, group: str, sample_idx: str) -> Mapping:
+    def get(self,
+            group: str,
+            sample_idx: str,
+            prefetch_raw_shard_ids: Optional[Sequence[str]] = None) -> Mapping:
         sample_idx = str(sample_idx)
         self.stats['get_calls'] += 1
         with self.lock:
@@ -262,7 +284,8 @@ class ShardMemoryStore:
                 key = (group, sample_entry['shard_id'])
                 if key in self.shard_lru:
                     self.shard_lru.move_to_end(key)
-                self._schedule_prefetch(sample_idx, group)
+                self._schedule_prefetch(sample_idx, group,
+                                        prefetch_raw_shard_ids)
                 self._debug_stats()
                 return sample
 
@@ -270,7 +293,7 @@ class ShardMemoryStore:
         self.stats['cache_misses'] += 1
         self._wait_for_prefetch(group, sample_entry['shard_id'])
         shard = self._load_shard(group, sample_entry['shard_id'])
-        self._schedule_prefetch(sample_idx, group)
+        self._schedule_prefetch(sample_idx, group, prefetch_raw_shard_ids)
         self._debug_stats()
         return shard['samples'][sample_entry['offset']]
 
@@ -279,11 +302,15 @@ class ShardMemoryStore:
             return None
         return self.get(group, sample_idx)
 
-    def _schedule_prefetch(self, sample_idx: str, accessed_group: str) -> None:
+    def _schedule_prefetch(
+            self,
+            sample_idx: str,
+            accessed_group: str,
+            prefetch_raw_shard_ids: Optional[Sequence[str]] = None) -> None:
         if (self.preload_mode != 'lazy' or self.prefetch_executor is None
                 or accessed_group != self.raw_group):
             return
-        tasks = self._next_prefetch_tasks(sample_idx)
+        tasks = self._next_prefetch_tasks(sample_idx, prefetch_raw_shard_ids)
         for task in tasks:
             with self.lock:
                 group, shard_id = task
@@ -304,24 +331,36 @@ class ShardMemoryStore:
             with self.lock:
                 self.prefetch_futures.pop(task, None)
 
-    def _next_prefetch_tasks(self, sample_idx: str) -> Sequence[Tuple[str, str]]:
+    def _next_prefetch_tasks(
+            self,
+            sample_idx: str,
+            prefetch_raw_shard_ids: Optional[Sequence[str]] = None
+    ) -> Sequence[Tuple[str, str]]:
         raw_entry = self.index['by_sample_idx'][sample_idx]['groups'].get(
             self.raw_group)
         if raw_entry is None:
             return []
-        raw_shard_ids = sorted(self.group_manifests[self.raw_group]['shards'])
-        if self.raw_shard_order:
-            raw_shard_ids = self.raw_shard_order
-        try:
-            raw_pos = raw_shard_ids.index(raw_entry['shard_id'])
-        except ValueError:
-            return []
+        if prefetch_raw_shard_ids is not None:
+            raw_ids_to_prefetch = [
+                str(shard_id) for shard_id in prefetch_raw_shard_ids
+                if str(shard_id)
+            ]
+        else:
+            raw_shard_ids = sorted(self.group_manifests[self.raw_group]['shards'])
+            if self.raw_shard_order:
+                raw_shard_ids = self.raw_shard_order
+            try:
+                raw_pos = raw_shard_ids.index(raw_entry['shard_id'])
+            except ValueError:
+                return []
+            raw_ids_to_prefetch = raw_shard_ids[
+                raw_pos + 1:raw_pos + 1 + self.prefetch_shards]
 
         tasks = []
         group_ranges = self.index.get('groups', {})
-        raw_ids_to_prefetch = raw_shard_ids[raw_pos:raw_pos + 1 +
-                                            self.prefetch_shards]
         for next_raw_id in raw_ids_to_prefetch:
+            if next_raw_id not in group_ranges[self.raw_group]:
+                continue
             raw_range = group_ranges[self.raw_group][next_raw_id]
             start, end = raw_range['start'], raw_range['end']
             for group in self.groups:

@@ -23,7 +23,8 @@ class ShardAwareSampler(Sampler):
                  seed: Optional[int] = None,
                  round_up: bool = True,
                  raw_group: str = 'raw_nuscenes',
-                 num_workers: int = 1) -> None:
+                 num_workers: int = 1,
+                 prefetch_shards: int = 1) -> None:
         rank, world_size = get_dist_info()
         self.dataset = dataset
         self.rank = rank
@@ -34,6 +35,7 @@ class ShardAwareSampler(Sampler):
         self.round_up = round_up
         self.raw_group = raw_group
         self.num_workers = max(1, int(num_workers))
+        self.prefetch_shards = max(0, int(prefetch_shards))
         self.num_samples_per_rank = self._estimate_samples_per_rank()
         self.total_size = self.num_samples_per_rank * world_size
 
@@ -53,7 +55,7 @@ class ShardAwareSampler(Sampler):
         max_shard_len = max(len(indices) for indices in index.values())
         return max_shards_per_rank * max_shard_len
 
-    def __iter__(self) -> Iterator[int]:
+    def __iter__(self) -> Iterator:
         index = self.dataset.get_raw_shard_indices(self.raw_group)
         shard_ids = list(index)
         if self.shuffle:
@@ -67,7 +69,7 @@ class ShardAwareSampler(Sampler):
         rank_shard_ids = shard_ids[self.rank::self.world_size]
         if self.round_up and not rank_shard_ids and shard_ids:
             rank_shard_ids = [shard_ids[self.rank % len(shard_ids)]]
-        worker_streams = [[] for _ in range(self.num_workers)]
+        worker_shards = [[] for _ in range(self.num_workers)]
         for shard_pos, shard_id in enumerate(rank_shard_ids):
             shard_indices = list(index[shard_id])
             if self.shuffle:
@@ -77,7 +79,18 @@ class ShardAwareSampler(Sampler):
                 perm = torch.randperm(
                     len(shard_indices), generator=generator).tolist()
                 shard_indices = [shard_indices[i] for i in perm]
-            worker_streams[shard_pos % self.num_workers].extend(shard_indices)
+            worker_shards[shard_pos % self.num_workers].append(
+                (shard_id, shard_indices))
+
+        worker_streams = [[] for _ in range(self.num_workers)]
+        for worker_id, shard_stream in enumerate(worker_shards):
+            for shard_pos, (_, shard_indices) in enumerate(shard_stream):
+                next_raw_shards = tuple(
+                    shard_id for shard_id, _ in shard_stream[
+                        shard_pos + 1:shard_pos + 1 + self.prefetch_shards])
+                worker_streams[worker_id].extend(
+                    (sample_index, next_raw_shards)
+                    for sample_index in shard_indices)
 
         indices = []
         max_stream_len = max((len(stream) for stream in worker_streams),

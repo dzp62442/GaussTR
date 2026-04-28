@@ -28,6 +28,7 @@ class NuScenesOccShardedDataset(BaseDataset):
                  prefetch_workers=1,
                  debug=False,
                  debug_interval=100,
+                 slow_log_threshold=0.0,
                  torch_load_retries=3,
                  torch_load_retry_wait=1.0,
                  metainfo=None,
@@ -58,6 +59,7 @@ class NuScenesOccShardedDataset(BaseDataset):
         self.prefetch_workers = int(prefetch_workers)
         self.debug = bool(debug)
         self.debug_interval = int(debug_interval)
+        self.slow_log_threshold = float(slow_log_threshold)
         self.torch_load_retries = int(torch_load_retries)
         self.torch_load_retry_wait = float(torch_load_retry_wait)
         self.store: Optional[ShardMemoryStore] = None
@@ -105,6 +107,7 @@ class NuScenesOccShardedDataset(BaseDataset):
             raw_shard_order=self.raw_shard_order,
             debug=self.debug,
             debug_interval=self.debug_interval,
+            slow_log_threshold=self.slow_log_threshold,
             torch_load_retries=self.torch_load_retries,
             torch_load_retry_wait=self.torch_load_retry_wait)
 
@@ -141,15 +144,26 @@ class NuScenesOccShardedDataset(BaseDataset):
         if self.store is not None:
             self.store.raw_shard_order = self.raw_shard_order
 
+    @staticmethod
+    def _parse_index(idx):
+        if isinstance(idx, tuple) and len(idx) == 2:
+            sample_index, next_raw_shards = idx
+            return int(sample_index), tuple(str(item) for item in next_raw_shards)
+        return int(idx), None
+
     def get_data_info(self, idx: int) -> dict:
         if self.index is None:
             self.full_init()
         store = self._get_store()
 
-        item = self.data_list[idx]
+        sample_index, next_raw_shards = self._parse_index(idx)
+        item = self.data_list[sample_index]
         sample_idx = str(item['sample_idx'])
         raw_group = self.required_groups.get('raw', 'raw_nuscenes')
-        raw_sample = store.get(raw_group, sample_idx)
+        raw_sample = store.get(
+            raw_group,
+            sample_idx,
+            prefetch_raw_shard_ids=next_raw_shards)
 
         results = copy.deepcopy(raw_sample['meta'])
         results['sample_idx'] = sample_idx

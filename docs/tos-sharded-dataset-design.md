@@ -317,6 +317,27 @@ raw_nuscenes 用 raw target，默认约 100MB
 
 因此，训练随机性来自 epoch 级 shard shuffle 和 shard 内 sample shuffle；预处理时的 `sample_order` 只提供稳定全局索引，不要求 dataloader 再做完全 sample-level 随机访问。
 
+### 7.1 worker-local shard stream
+
+训练使用 map-style dataset，真正的取样顺序由主进程 sampler 产生，再由 PyTorch DataLoader 分发给 worker。为了保持大文件局部性，`ShardAwareSampler` 的输出必须满足：
+
+```text
+每个 rank 先获得一组 raw shard
+每个 raw shard 内按 epoch seed shuffle 样本
+raw shard 以 worker stream 为单位分配
+sampler 按 worker round-robin 交错输出样本
+```
+
+在 `batch_size=1`、`sampler.num_workers == dataloader.num_workers` 时，PyTorch DataLoader 会把交错后的第 `i, i + num_workers, ...` 个样本发给同一个 worker，因此每个 worker 实际消费的是自己的 raw shard stream。
+
+这个约束不是普通 sample-level 随机采样；它是 shard-local 随机采样。随机性来自：
+
+- epoch 级 raw shard shuffle；
+- shard 内 sample shuffle；
+- DDP rank 间 raw shard 分片。
+
+不能在 worker 内再通过 sorted shard id 推断“下一个 raw shard”。sampler 必须把 worker-local 的 next raw shard 信息随样本索引一起传给 dataset/store，否则 worker 预取会沿全局 sorted 顺序走，和真实消费顺序不一致。
+
 ## 8. dataloader 设计
 
 ### 8.1 设计取舍
@@ -396,8 +417,9 @@ pin_memory = True
 
 ```text
 当前 sample 访问了 raw_nuscenes/000123
-根据 raw shard 覆盖的 global offset 区间
-找到下一段 raw shard 以及其覆盖的 depth/feat/sem shards
+sampler 随当前 sample 传入当前 worker stream 的 next raw shard id
+根据 next raw shard 覆盖的 global offset 区间
+找到其覆盖的 raw/depth/feat/sem shards
 后台线程提前 torch.load 这些 shard 到 LRU
 ```
 
@@ -410,7 +432,9 @@ prefetch_shards = 1
 prefetch_workers = 1
 ```
 
-含义是访问当前 raw shard 时，后台预取下一个 raw shard 及其覆盖的 required group shards。预取线程只读 TOS mount，不写本地盘。
+含义是访问当前 raw shard 时，后台预取当前 worker stream 的下一个 raw shard 及其覆盖的 required group shards。预取线程只读 TOS mount，不写本地盘。
+
+预取窗口不应包含当前 raw shard。当前样本所需的 raw 和派生 group 如果未命中，应该由前台同步加载；后台预取只负责下一段 worker-local raw shard，避免启动阶段把当前 shard 覆盖的所有派生 shard 都压入后台队列，造成 TOS 并发读放大和错误预取。
 
 ### 8.4 与 pixelSplat 的关系
 
