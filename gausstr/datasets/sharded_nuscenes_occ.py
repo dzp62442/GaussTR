@@ -22,7 +22,7 @@ class NuScenesOccShardedDataset(BaseDataset):
                  split='train',
                  required_groups: Optional[Dict[str, Optional[str]]] = None,
                  preload_mode='lazy',
-                 require_success=True,
+                 require_success=False,
                  max_cache_bytes=24 * 1024**3,
                  prefetch_shards=1,
                  prefetch_workers=1,

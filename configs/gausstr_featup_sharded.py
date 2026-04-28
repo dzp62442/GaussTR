@@ -53,6 +53,7 @@ train_dataloader = dict(
         shard_root='data/gausstr_shards',
         split='train',
         preload_mode='lazy',
+        require_success=False,
         max_cache_bytes=24 * 1024**3,
         prefetch_shards=1,
         prefetch_workers=1,

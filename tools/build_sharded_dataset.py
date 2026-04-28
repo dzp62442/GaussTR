@@ -1186,6 +1186,100 @@ def write_build_success(split_root: Path, summary: Mapping[str, Any]) -> None:
     success_tmp.replace(success_path)
 
 
+def validate_sharded_output(
+        args: argparse.Namespace,
+        group_manifests: Mapping[str, Mapping[str, Any]]) -> Dict[str, Any]:
+    split_root = args.out_root / args.split
+    validation = {
+        'schema_version': 1,
+        'time': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        'ok': True,
+        'num_groups': len(group_manifests),
+        'num_shards': 0,
+        'num_torch_files': 0,
+        'num_success_files': 0,
+        'num_sha256_files': 0,
+        'num_tmp_files': 0,
+        'groups': {},
+        'errors': [],
+    }
+
+    def add_error(message: str) -> None:
+        validation['ok'] = False
+        validation['errors'].append(message)
+
+    for group_name, manifest in sorted(group_manifests.items()):
+        group_summary = {
+            'num_shards': 0,
+            'num_torch_files': 0,
+            'num_success_files': 0,
+            'num_sha256_files': 0,
+            'bytes': 0,
+        }
+        for shard_id, entry in sorted(manifest.get('shards', {}).items()):
+            group_summary['num_shards'] += 1
+            validation['num_shards'] += 1
+            torch_path = split_root / entry['path']
+            success_path = split_root / entry.get(
+                'success_path',
+                str(Path(entry['path']).with_suffix('.SUCCESS')))
+            sha_path = torch_path.with_suffix(torch_path.suffix + '.sha256')
+
+            if not torch_path.exists():
+                add_error(f'missing shard file: {torch_path}')
+                continue
+            actual_bytes = torch_path.stat().st_size
+            expected_bytes = int(entry.get('bytes', actual_bytes))
+            if actual_bytes != expected_bytes:
+                add_error(
+                    f'shard size mismatch: {torch_path} '
+                    f'expected={expected_bytes} actual={actual_bytes}')
+            group_summary['num_torch_files'] += 1
+            validation['num_torch_files'] += 1
+            group_summary['bytes'] += actual_bytes
+
+            if success_path.exists():
+                group_summary['num_success_files'] += 1
+                validation['num_success_files'] += 1
+            else:
+                add_error(f'missing success marker: {success_path}')
+
+            expected_sha = entry.get('sha256')
+            if expected_sha is not None:
+                if not sha_path.exists():
+                    add_error(f'missing sha256 file: {sha_path}')
+                else:
+                    actual_sha = sha_path.read_text(
+                        encoding='utf-8').strip()
+                    if actual_sha != expected_sha:
+                        add_error(
+                            f'sha256 sidecar mismatch: {sha_path}')
+                    group_summary['num_sha256_files'] += 1
+                    validation['num_sha256_files'] += 1
+        validation['groups'][group_name] = group_summary
+
+    tmp_files = sorted(split_root.rglob('*.tmp'))
+    validation['num_tmp_files'] = len(tmp_files)
+    for tmp_path in tmp_files[:20]:
+        add_error(f'stale tmp file: {tmp_path}')
+    if len(tmp_files) > 20:
+        add_error(f'{len(tmp_files) - 20} more stale tmp files under {split_root}')
+
+    if not validation['ok']:
+        preview = '\n'.join(validation['errors'][:20])
+        raise RuntimeError(
+            'Sharded dataset validation failed after preprocessing:\n'
+            f'{preview}')
+
+    print(
+        'Validated sharded output: '
+        f"{validation['num_shards']} shards, "
+        f"{validation['num_torch_files']} .torch files, "
+        f"{validation['num_success_files']} .SUCCESS files, "
+        f"{validation['num_sha256_files']} .sha256 files.")
+    return validation
+
+
 def make_public_shard_plan(shard_plan: Mapping[str, Any]) -> Dict[str, Any]:
     public_plan = copy.deepcopy(dict(shard_plan))
     for shard in public_plan['shards']:
@@ -1312,14 +1406,17 @@ def main() -> None:
                     group_plan_hashes)
 
     group_manifests = {}
+    full_group_manifests = {}
     for group in groups:
         group_manifest = write_group_shards(args, infos, group_plans[group[2]],
                                             group, sample_order_hash)
+        full_group_manifests[group[2]] = group_manifest
         group_manifests[group[2]] = {
             'relative_dir': group_manifest['relative_dir'],
             'num_shards': len(group_manifest['shards']),
             'samples_per_shard': group_plans[group[2]]['samples_per_shard'],
         }
+    validation = validate_sharded_output(args, full_group_manifests)
 
     summary = {
         'schema_version': 2,
@@ -1328,6 +1425,7 @@ def main() -> None:
         'sample_order_sha256': sample_order_hash,
         'groups': group_manifests,
         'group_plan_sha256': group_plan_hashes,
+        'validation': validation,
     }
     dump_json(split_root / 'build_summary.json', summary, overwrite=True)
     write_build_success(split_root, summary)

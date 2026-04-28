@@ -361,6 +361,8 @@ cache value = torch.load(...) 后的 shard payload
 4. 加入 LRU，必要时逐出最久未访问 shard
 ```
 
+训练默认不检查 `.SUCCESS`，也不读取 `.sha256`。完整性检查前移到预处理结束阶段，dataloader 热路径只需要读取 manifest/index 和实际 `.torch` shard，避免每个 shard 首次加载时额外访问 sidecar 文件。
+
 cache 预算按 DataLoader worker 进程设置：
 
 ```text
@@ -535,6 +537,7 @@ train_dataloader = dict(
         shard_root='data/gausstr_shards',
         split='train',
         preload_mode='lazy',
+        require_success=False,
         max_cache_bytes=24 * 1024**3,
         prefetch_shards=1,
         prefetch_workers=1,
@@ -691,6 +694,24 @@ group_manifest.json
 
 TOS/FUSE 挂载路径上，`torch.save()` 返回后立刻 `torch.load()` 可能短暂读到未完全可见的 zip central directory。脚本会对这类 sanity-load 错误重试；如果重试后仍失败，不写 `.SUCCESS`，下次重跑会把不完整 shard 当作未完成文件重建。
 
+### 阶段 F：结束校验
+
+所有 group 写完后，脚本会按 `group_manifest.json` 对数据目录做一次完整性检查：
+
+- `.torch` 文件存在。
+- `.torch` 文件大小与 manifest 记录一致。
+- `.SUCCESS` 文件存在。
+- 如果 manifest 记录了 sha256，则 `.sha256` sidecar 存在且内容一致。
+- 不存在残留 `.tmp` 文件。
+
+校验结果写入：
+
+```text
+build_summary.json -> validation
+```
+
+校验通过后，训练 dataloader 默认 `require_success=False`，不会再检查 `.SUCCESS`。如果确认不需要在同一个目录继续断点续跑预处理，可以手动删除 `.SUCCESS` 和 `.sha256` sidecar，以减少 TOS 文件数量；删除后不要再对这个目录直接重跑预处理脚本，否则脚本会把“有 `.torch` 但无 `.SUCCESS`”视为未完成 shard。
+
 ## 11. 与当前 pipeline 的关系
 
 现有 GaussTR 数据流大致为：
@@ -733,6 +754,7 @@ num_views
 - group 独立 shard size，但按 base block 对齐。
 - TOS 挂载路径 direct `torch.load()`。
 - 中断后跳过已完成 shard。
+- 预处理结束后的目录完整性检查。
 - lazy LRU 内存 cache。
 - DataLoader worker 内 shard 预取。
 - 单机多卡 `ShardAwareSampler`。

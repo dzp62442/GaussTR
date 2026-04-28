@@ -56,7 +56,7 @@ class ShardMemoryStore:
                  split: str,
                  groups: Iterable[str],
                  preload_mode: str = 'lazy',
-                 require_success: bool = True,
+                 require_success: bool = False,
                  max_cache_bytes: int = 24 * 1024**3,
                  prefetch_shards: int = 1,
                  prefetch_workers: int = 1,
