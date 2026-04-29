@@ -125,6 +125,16 @@ profile 配置表达本次 materialized view 从哪些原始目录取字段。�
     "feats": "featup",
     "sem_seg": "grounded_sam2",
     "occ_gt": true
+  },
+  "materialization": {
+    "image_size": [432, 768],
+    "resize_scale": 0.48,
+    "patch_size": 16,
+    "raw_images": true,
+    "depth": true,
+    "sem_seg": true,
+    "feats": false,
+    "occ_gt": false
   }
 }
 ```
@@ -135,13 +145,26 @@ profile 配置表达本次 materialized view 从哪些原始目录取字段。�
 talk2dino_metric3d:
   train: raw + depth_metric3d
   val:   raw + depth_metric3d + occ_gt
+  image/depth materialized resolution: 504 x 896
+  patch_size: 14
 
 featup_metric3d_sam2:
   train: raw + depth_metric3d + feats_featup + sem_seg_grounded_sam2
   val:   raw + depth_metric3d + feats_featup + occ_gt
+  image/depth/sem_seg materialized resolution: 432 x 768
+  featup resolution: 512 x 27 x 48
+  patch_size: 16
 ```
 
-profile 只做声明式字段选择，不做隐式 fallback。缺少任何必需源文件应 fail-fast，除非显式传入 debug/allow-missing 参数。
+profile 只做声明式字段选择和 profile 分辨率声明，不做隐式 fallback。缺少任何必需源文件应 fail-fast，除非显式传入 debug/allow-missing 参数。
+
+training chunk 是按 profile 生成的 materialized view。不同 profile 不仅字段组合不同，输入分辨率也不同，因此不能混用：
+
+- `featup_metric3d_sam2` 对应 `gausstr_featup.py`，模型图像输入是 `(H, W) = (432, 768)`。
+- `talk2dino_metric3d` 对应 `gausstr_talk2dino.py`，模型图像输入是 `(H, W) = (504, 896)`。
+- 预处理阶段应把 raw image bytes、depth、sem_seg 等会在训练中按固定 `ImageAug3D` 缩放的字段提前 materialize 到 profile 分辨率，避免训练时每个 iteration 从 TOS 读取 900x1600 dense maps 再下采样。
+- `feats_featup` 已经是模型 patch grid 分辨率 `512 x 27 x 48`，不再做 image-space resize。
+- `occ_gt` 保持原 voxel grid，不做图像分辨率 materialization。
 
 ## 4. Chunk 内容
 
@@ -183,6 +206,32 @@ profile 只做声明式字段选择，不做隐式 fallback。缺少任何必需
 ```
 
 sample 内部仍按字段组织；改变的是这些字段被放在同一个 chunk 文件内。chunk sample 应尽量贴近当前 pipeline 需要的 `results` 字段，避免 dataloader 再从磁盘补字段。
+
+新生成 chunk 中，已按 profile 分辨率 materialize 的字段需要显式记录：
+
+```python
+sample["image_bytes"]["CAM_FRONT"] = {
+    "bytes": resized_jpeg_bytes,
+    "materialized": True,
+    "original_shape": [900, 1600],
+    "shape": [432, 768],
+    "resize_scale": 0.48,
+    "crop_xy": [0, 0],
+    "img_aug_mat": ...,
+}
+
+sample["depth"]["CAM_FRONT"] = {
+    "tensor": torch.Tensor(shape=[432, 768]),
+    "materialized": True,
+}
+
+sample["sem_seg"]["CAM_FRONT"] = {
+    "tensor": torch.Tensor(shape=[432, 768]),
+    "materialized": True,
+}
+```
+
+chunk-aware pipeline loader 看到 `materialized=true` 时，不应再次对这些字段执行 `ImageAug3D` 的 resize/crop；它应复用 chunk 中记录的 `img_aug_mat`，保证相机投影矩阵语义与旧在线 resize 路径一致。
 
 训练 pipeline 可以继续使用清晰的 logical keys：
 
@@ -307,13 +356,17 @@ data/nuscenes_grounded_sam2/**/*.npy
 1. 读取 `nuscenes_infos_{split}.pkl`，确定 split 样本列表。
 2. 根据 `ratio/max_samples/seed` 选择样本。train 可以 scene-level subset 后 deterministic shuffle；val/test 保持稳定顺序。
 3. 根据 profile 解析每个 sample 所需的 image/depth/feat/sem/occ 路径。
-4. sizing pass：随机抽样 assemble sample，默认 4 个，估算 p90/p95 sample bytes，确定固定 `samples_per_chunk`。
-5. build pass：按固定 `samples_per_chunk` 顺序 assemble 完整 samples。
-6. 写 `000000.torch.tmp`。
-7. sanity `torch.load`，校验 sample 数、必需字段、shape/dtype。
-8. 计算 sha256，原子 rename 为 `.torch`。
-9. 写 `profile.json`、`chunk_manifest.json` 和 `index.json`。
-10. 结束时做全目录校验，确认无缺真实样本、无重复真实样本、padding 标记正确、无残留 `.tmp`。
+4. 根据 profile 分辨率 materialize 输入字段：
+   - `featup_metric3d_sam2`: raw image、depth、sem_seg resize/crop 到 `432 x 768`；featup 保持 `512 x 27 x 48`。
+   - `talk2dino_metric3d`: raw image、depth resize/crop 到 `504 x 896`。
+   - val/test 的 occ_gt 保持原 voxel grid。
+5. sizing pass：随机抽样 assemble sample，默认 4 个，估算 p90/p95 sample bytes，确定固定 `samples_per_chunk`。
+6. build pass：按固定 `samples_per_chunk` 顺序 assemble 完整 samples。
+7. 写 `000000.torch.tmp`。
+8. sanity `torch.load`，校验 sample 数、必需字段、shape/dtype。
+9. 计算 sha256，原子 rename 为 `.torch`。
+10. 写 `profile.json`、`chunk_manifest.json` 和 `index.json`。
+11. 结束时做全目录校验，确认无缺真实样本、无重复真实样本、padding 标记正确、无残留 `.tmp`。
 
 这里的 join 发生在离线预处理阶段，不发生在训练热路径。由于输入是原始小文件和派生小文件，预处理阶段可以使用多线程/多进程并行读取；训练阶段只面对完整 chunk 文件。
 
@@ -410,6 +463,9 @@ _chunk_sem_seg
 
 - Dataset 从 chunk sample 中构造与现有 pipeline 期望一致的 `results`。
 - 新增 loader 类只从 `results` 内存字段取值，不再访问磁盘。
+- 对新 materialized chunk，`BEVLoadMultiViewImageFromChunks` 解码的 image 已经是 profile 输入分辨率，并向 `ImageAug3D` 传递 chunk 中的 `img_aug_mat`；`ImageAug3D` 不再重复 resize/crop。
+- `LoadChunkFeatMaps(depth/sem_seg)` 对 `materialized=true` 的字段跳过运行时 `apply_aug`，直接 stack 已 materialized 的 tensor。
+- 旧 chunk 没有 `materialized` 标记时仍走旧逻辑，继续在训练 pipeline 中 resize/crop。
 - 模型侧 `GaussTR.prepare_inputs()` 不应感知数据来自 chunk。
 
 ## 10. 训练 IO 模式对比

@@ -26,6 +26,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image
 
 
 CAMERA_ORDER = (
@@ -42,11 +44,17 @@ PROFILE_DEFS = {
         'depth': 'metric3d',
         'feats': None,
         'sem_seg': None,
+        'image_size': (504, 896),
+        'resize_scale': 0.56,
+        'patch_size': 14,
     },
     'featup_metric3d_sam2': {
         'depth': 'metric3d',
         'feats': 'featup',
         'sem_seg': 'grounded_sam2',
+        'image_size': (432, 768),
+        'resize_scale': 0.48,
+        'patch_size': 16,
     },
 }
 
@@ -538,6 +546,61 @@ def read_file_bytes(path: Path, allow_missing: bool) -> Optional[bytes]:
         raise
 
 
+def profile_image_size(profile_name: str) -> Tuple[int, int]:
+    return tuple(PROFILE_DEFS[profile_name]['image_size'])  # type: ignore
+
+
+def profile_resize_scale(profile_name: str) -> float:
+    return float(PROFILE_DEFS[profile_name]['resize_scale'])
+
+
+def materialized_aug_mat(resize_scale: float,
+                         crop_xy: Tuple[int, int] = (0, 0)) -> List[List[float]]:
+    crop_x, crop_y = crop_xy
+    mat = np.eye(4, dtype=np.float32)
+    mat[0, 0] = resize_scale
+    mat[1, 1] = resize_scale
+    mat[0, 3] = -float(crop_x)
+    mat[1, 3] = -float(crop_y)
+    return mat.tolist()
+
+
+def materialize_image_bytes(data: Optional[bytes],
+                            target_hw: Tuple[int, int],
+                            resize_scale: float,
+                            allow_missing: bool) -> Tuple[Optional[bytes], Dict[str, Any]]:
+    if data is None:
+        if allow_missing:
+            return None, {}
+        raise FileNotFoundError('Cannot materialize missing image bytes.')
+
+    target_h, target_w = target_hw
+    image = Image.open(io.BytesIO(data)).convert('RGB')
+    original_w, original_h = image.size
+    resize_w = int(original_w * resize_scale)
+    resize_h = int(original_h * resize_scale)
+    if resize_w < target_w or resize_h < target_h:
+        raise ValueError(
+            f'Resized image {(resize_h, resize_w)} is smaller than target '
+            f'{target_hw}. original={(original_h, original_w)} '
+            f'resize_scale={resize_scale}.')
+    crop_x = max(0, (resize_w - target_w) // 2)
+    crop_y = max(0, resize_h - target_h)
+    image = image.resize((resize_w, resize_h))
+    image = image.crop((crop_x, crop_y, crop_x + target_w, crop_y + target_h))
+    buffer = io.BytesIO()
+    image.save(buffer, format='JPEG', quality=95)
+    return buffer.getvalue(), {
+        'materialized': True,
+        'original_shape': [original_h, original_w],
+        'shape': [target_h, target_w],
+        'resize_scale': resize_scale,
+        'crop_xy': [crop_x, crop_y],
+        'img_aug_mat': materialized_aug_mat(resize_scale, (crop_x, crop_y)),
+        'encoding': 'jpeg',
+    }
+
+
 def load_npy_tensor(path: Path, allow_missing: bool) -> Optional[torch.Tensor]:
     try:
         array = io_call_with_retry(f'np.load {path}', lambda: np.load(path))
@@ -546,6 +609,43 @@ def load_npy_tensor(path: Path, allow_missing: bool) -> Optional[torch.Tensor]:
             return None
         raise
     return torch.from_numpy(np.asarray(array))
+
+
+def resize_2d_tensor(tensor: Optional[torch.Tensor],
+                     target_hw: Tuple[int, int],
+                     mode: str,
+                     resize_scale: float) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    if tensor.ndim != 2:
+        raise ValueError(
+            f'Expected a 2D tensor for materialized resize, got {tensor.shape}.')
+    target_h, target_w = target_hw
+    h, w = int(tensor.shape[0]), int(tensor.shape[1])
+    resize_h = int(h * resize_scale)
+    resize_w = int(w * resize_scale)
+    if resize_w < target_w or resize_h < target_h:
+        raise ValueError(
+            f'Resized tensor {(resize_h, resize_w)} is smaller than target '
+            f'{target_hw}. original={(h, w)} resize_scale={resize_scale}.')
+    crop_x = max(0, (resize_w - target_w) // 2)
+    crop_y = max(0, resize_h - target_h)
+    orig_dtype = tensor.dtype
+    value = tensor
+    if not torch.is_floating_point(value):
+        value = value.float()
+    kwargs = {}
+    if mode != 'nearest':
+        kwargs['align_corners'] = False
+    value = F.interpolate(
+        value[None, None],
+        size=(resize_h, resize_w),
+        mode=mode,
+        **kwargs).squeeze(0).squeeze(0)
+    value = value[crop_y:crop_y + target_h, crop_x:crop_x + target_w]
+    if not torch.is_floating_point(torch.empty((), dtype=orig_dtype)):
+        value = value.round().to(orig_dtype)
+    return value
 
 
 def load_occ_npz(path: Path, allow_missing: bool) -> Optional[Dict[str, torch.Tensor]]:
@@ -604,6 +704,16 @@ def profile_payload(args: argparse.Namespace,
             'sem_seg': fields.get('sem_seg'),
             'occ_gt': bool(fields.get('occ_gt')),
         },
+        'materialization': {
+            'image_size': list(profile_image_size(args.profile)),
+            'resize_scale': profile_resize_scale(args.profile),
+            'patch_size': int(PROFILE_DEFS[args.profile]['patch_size']),
+            'raw_images': True,
+            'depth': bool(fields.get('depth')),
+            'sem_seg': bool(fields.get('sem_seg')),
+            'feats': False,
+            'occ_gt': False,
+        },
         'camera_order': list(CAMERA_ORDER),
     }
     payload['profile_sha256'] = stable_json_hash(payload)
@@ -617,6 +727,8 @@ def build_sample(args: argparse.Namespace, info: Mapping[str, Any],
                  source_sample_idx: Optional[str] = None) -> Dict[str, Any]:
     image_prefix = args.image_prefix or args.data_root
     sample_idx = sample_identifier(info)
+    target_hw = profile_image_size(args.profile)
+    resize_scale = profile_resize_scale(args.profile)
     sample = {
         'sample_idx': sample_idx,
         'source_sample_idx': source_sample_idx or sample_idx,
@@ -634,10 +746,14 @@ def build_sample(args: argparse.Namespace, info: Mapping[str, Any],
             info, args.allow_nonstandard_cameras):
         path = resolve_image_path(
             args.data_root, image_prefix, cam_name, str(cam_item['img_path']))
+        raw_bytes = read_file_bytes(path, args.allow_missing)
+        image_bytes, image_materialization = materialize_image_bytes(
+            raw_bytes, target_hw, resize_scale, args.allow_missing)
         sample['image_bytes'][cam_name] = {
             'img_path': str(cam_item['img_path']),
             'source_path': str(path),
-            'bytes': read_file_bytes(path, args.allow_missing),
+            'bytes': image_bytes,
+            **image_materialization,
         }
 
     for kind in ('depth', 'feats', 'sem_seg'):
@@ -647,10 +763,24 @@ def build_sample(args: argparse.Namespace, info: Mapping[str, Any],
         for cam_name, cam_item in iter_cameras(
                 info, args.allow_nonstandard_cameras):
             path = modality_file_path(args, kind, info, cam_item)
+            tensor = load_npy_tensor(path, args.allow_missing)
+            materialized = False
+            if kind == 'depth':
+                tensor = resize_2d_tensor(
+                    tensor, target_hw, mode='bilinear',
+                    resize_scale=resize_scale)
+                materialized = True
+            elif kind == 'sem_seg':
+                tensor = resize_2d_tensor(
+                    tensor, target_hw, mode='nearest',
+                    resize_scale=resize_scale)
+                materialized = True
             views[cam_name] = {
                 'img_path': str(cam_item['img_path']),
                 'source_path': str(path),
-                'tensor': load_npy_tensor(path, args.allow_missing),
+                'tensor': tensor,
+                'materialized': materialized,
+                'shape': list(tensor.shape) if tensor is not None else None,
             }
         sample[kind] = views
 

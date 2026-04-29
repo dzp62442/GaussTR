@@ -263,6 +263,17 @@ class BEVLoadMultiViewImageFromChunks(BEVLoadMultiViewImageFromFiles):
         results['img_shape'] = img.shape[:2]
         results['ori_shape'] = img.shape[:2]
         results['pad_shape'] = img.shape[:2]
+        materialized = [
+            bool(chunk_images[cam_name].get('materialized', False))
+            for cam_name in results['images']
+        ]
+        if materialized and all(materialized):
+            results['_chunk_materialized_image'] = True
+            results['_chunk_img_aug_mat'] = [
+                np.array(
+                    chunk_images[cam_name]['img_aug_mat'],
+                    dtype=np.float32) for cam_name in results['images']
+            ]
         if self.set_default_scale:
             results['scale_factor'] = 1.0
         num_channels = 1 if len(img.shape) < 3 else img.shape[2]
@@ -456,6 +467,10 @@ class ImageAug3D(BaseTransform):
         return img, rotation, translation
 
     def transform(self, data):
+        if data.get('_chunk_materialized_image', False):
+            data['img_aug_mat'] = data['_chunk_img_aug_mat']
+            return data
+
         imgs = data['img']
         new_imgs = []
         transforms = []
@@ -640,7 +655,8 @@ class LoadChunkFeatMaps(BaseTransform):
             if not isinstance(feat, torch.Tensor):
                 feat = torch.from_numpy(np.asarray(feat))
 
-            if self.apply_aug and img_aug_mats is not None:
+            if (self.apply_aug and img_aug_mats is not None
+                    and not bool(views[cam_name].get('materialized', False))):
                 post_rot = img_aug_mats[i][:3, :3]
                 post_tran = img_aug_mats[i][:3, 3]
                 assert post_rot[0, 1] == post_rot[1, 0] == 0  # noqa
