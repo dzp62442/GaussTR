@@ -205,6 +205,76 @@ class BEVLoadMultiViewImageFromShards(BEVLoadMultiViewImageFromFiles):
 
 
 @TRANSFORMS.register_module()
+class BEVLoadMultiViewImageFromChunks(BEVLoadMultiViewImageFromFiles):
+    """Load multi-view images from fused chunk sample payloads."""
+
+    def transform(self, results: dict) -> Optional[dict]:
+        filename, cam2img, lidar2cam, cam2ego = [], [], [], []
+        chunk_images = results['_chunk_sample']['image_bytes']
+        for cam_name, cam_item in results['images'].items():
+            filename.append(cam_item['img_path'])
+            lidar2cam.append(cam_item['lidar2cam'])
+
+            cam2img_array = np.eye(4).astype(np.float32)
+            cam2img_array[:3, :3] = np.array(cam_item['cam2img']).astype(
+                np.float32)
+            cam2img.append(cam2img_array)
+
+            cam2ego_array = np.array(cam_item['cam2ego']).astype(np.float32)
+            cam2ego.append(cam2ego_array)
+
+            if cam_name not in chunk_images:
+                raise KeyError(
+                    f'Chunk image payload missing camera {cam_name}.')
+
+        results['img_path'] = filename
+        results['cam2img'] = np.stack(cam2img, axis=0)
+        results['lidar2cam'] = np.stack(lidar2cam, axis=0)
+        results['cam2ego'] = np.stack(cam2ego, axis=0)
+        results['ori_cam2img'] = copy.deepcopy(results['cam2img'])
+
+        img_bytes = [
+            _as_bytes(chunk_images[cam_name]['bytes'])
+            for cam_name in results['images']
+        ]
+        imgs = [
+            mmcv.imfrombytes(
+                img_byte,
+                flag=self.color_type,
+                backend='pillow',
+                channel_order='rgb') for img_byte in img_bytes
+        ]
+        img_shapes = np.stack([img.shape for img in imgs], axis=0)
+        img_shape_max = np.max(img_shapes, axis=0)
+        img_shape_min = np.min(img_shapes, axis=0)
+        assert img_shape_min[-1] == img_shape_max[-1]
+        pad_shape = img_shape_max[:2] if not np.all(
+            img_shape_max == img_shape_min) else None
+        if pad_shape is not None:
+            imgs = [
+                mmcv.impad(img, shape=pad_shape, pad_val=0) for img in imgs
+            ]
+        img = np.stack(imgs, axis=-1)
+        if self.to_float32:
+            img = img.astype(np.float32)
+
+        results['filename'] = filename
+        results['img'] = [img[..., i] for i in range(img.shape[-1])]
+        results['img_shape'] = img.shape[:2]
+        results['ori_shape'] = img.shape[:2]
+        results['pad_shape'] = img.shape[:2]
+        if self.set_default_scale:
+            results['scale_factor'] = 1.0
+        num_channels = 1 if len(img.shape) < 3 else img.shape[2]
+        results['img_norm_cfg'] = dict(
+            mean=np.zeros(num_channels, dtype=np.float32),
+            std=np.ones(num_channels, dtype=np.float32),
+            to_rgb=False)
+        results['num_views'] = self.num_views
+        return results
+
+
+@TRANSFORMS.register_module()
 class PointToMultiViewDepth(BaseTransform):
 
     def __init__(self, depth_cfg, downsample=1):
@@ -289,6 +359,23 @@ class LoadShardedOccFromArrays(BaseTransform):
     def transform(self, results):
         sample = results['_sharded_groups'][self.group]
         arrays = sample['occ_gt']['arrays']
+        results['gt_semantic_seg'] = self._to_numpy(arrays['semantics'])
+        results['mask_lidar'] = self._to_numpy(arrays['mask_lidar'])
+        results['mask_camera'] = self._to_numpy(arrays['mask_camera'])
+        return results
+
+
+@TRANSFORMS.register_module()
+class LoadChunkOccFromArrays(BaseTransform):
+
+    @staticmethod
+    def _to_numpy(value):
+        if isinstance(value, torch.Tensor):
+            return value.cpu().numpy()
+        return value
+
+    def transform(self, results):
+        arrays = results['_chunk_sample']['occ_gt']['arrays']
         results['gt_semantic_seg'] = self._to_numpy(arrays['semantics'])
         results['mask_lidar'] = self._to_numpy(arrays['mask_lidar'])
         results['mask_camera'] = self._to_numpy(arrays['mask_camera'])
@@ -503,6 +590,52 @@ class LoadShardedFeatMaps(BaseTransform):
             if cam_name not in views:
                 raise KeyError(
                     f'Sharded group {self.group} missing camera {cam_name}.')
+            feat = views[cam_name]['tensor']
+            if not isinstance(feat, torch.Tensor):
+                feat = torch.from_numpy(np.asarray(feat))
+
+            if self.apply_aug and img_aug_mats is not None:
+                post_rot = img_aug_mats[i][:3, :3]
+                post_tran = img_aug_mats[i][:3, 3]
+                assert post_rot[0, 1] == post_rot[1, 0] == 0  # noqa
+
+                h, w = feat.shape
+                integral = (not torch.is_floating_point(feat)
+                            or torch.all(feat == feat.floor()))
+                mode = 'nearest' if integral else 'bilinear'
+                orig_dtype = feat.dtype
+                interp_feat = feat
+                if not torch.is_floating_point(interp_feat):
+                    interp_feat = interp_feat.float()
+                feat = F.interpolate(
+                    interp_feat[None, None],
+                    (int(h * post_rot[1, 1] + 0.5),
+                     int(w * post_rot[0, 0] + 0.5)),
+                    mode=mode).squeeze()
+                feat = feat[int(post_tran[1]):, int(-post_tran[0]):]
+                if not torch.is_floating_point(torch.empty((), dtype=orig_dtype)):
+                    feat = feat.round().to(orig_dtype)
+            feats.append(feat)
+
+        results[self.key] = torch.stack(feats)
+        return results
+
+
+@TRANSFORMS.register_module()
+class LoadChunkFeatMaps(BaseTransform):
+
+    def __init__(self, key, apply_aug=False):
+        self.key = key
+        self.apply_aug = apply_aug
+
+    def transform(self, results):
+        sample = results['_chunk_sample']
+        views = sample[self.key]
+        feats = []
+        img_aug_mats = results.get('img_aug_mat')
+        for i, cam_name in enumerate(results['images']):
+            if cam_name not in views:
+                raise KeyError(f'Chunk field {self.key} missing camera {cam_name}.')
             feat = views[cam_name]['tensor']
             if not isinstance(feat, torch.Tensor):
                 feat = torch.from_numpy(np.asarray(feat))
