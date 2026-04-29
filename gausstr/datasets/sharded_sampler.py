@@ -24,7 +24,9 @@ class ShardAwareSampler(Sampler):
                  round_up: bool = True,
                  raw_group: str = 'raw_nuscenes',
                  num_workers: int = 1,
-                 prefetch_shards: int = 1) -> None:
+                 prefetch_shards: int = 1,
+                 sample_shuffle_block_size: int = 1,
+                 prefetch_samples: int = 16) -> None:
         rank, world_size = get_dist_info()
         self.dataset = dataset
         self.rank = rank
@@ -36,6 +38,8 @@ class ShardAwareSampler(Sampler):
         self.raw_group = raw_group
         self.num_workers = max(1, int(num_workers))
         self.prefetch_shards = max(0, int(prefetch_shards))
+        self.sample_shuffle_block_size = max(1, int(sample_shuffle_block_size))
+        self.prefetch_samples = max(0, int(prefetch_samples))
         self.num_samples_per_rank = self._estimate_samples_per_rank()
         self.total_size = self.num_samples_per_rank * world_size
 
@@ -76,21 +80,54 @@ class ShardAwareSampler(Sampler):
                 generator = torch.Generator()
                 generator.manual_seed(self.seed + self.epoch +
                                       int(shard_id))
-                perm = torch.randperm(
-                    len(shard_indices), generator=generator).tolist()
-                shard_indices = [shard_indices[i] for i in perm]
+                if self.sample_shuffle_block_size <= 1:
+                    perm = torch.randperm(
+                        len(shard_indices), generator=generator).tolist()
+                    shard_indices = [shard_indices[i] for i in perm]
+                else:
+                    block_size = self.sample_shuffle_block_size
+                    blocks = [
+                        shard_indices[start:start + block_size]
+                        for start in range(0, len(shard_indices), block_size)
+                    ]
+                    perm = torch.randperm(
+                        len(blocks), generator=generator).tolist()
+                    shard_indices = [
+                        sample_index for block_index in perm
+                        for sample_index in blocks[block_index]
+                    ]
             worker_shards[shard_pos % self.num_workers].append(
                 (shard_id, shard_indices))
 
-        worker_streams = [[] for _ in range(self.num_workers)]
+        worker_sample_streams = [[] for _ in range(self.num_workers)]
         for worker_id, shard_stream in enumerate(worker_shards):
-            for shard_pos, (_, shard_indices) in enumerate(shard_stream):
-                next_raw_shards = tuple(
-                    shard_id for shard_id, _ in shard_stream[
-                        shard_pos + 1:shard_pos + 1 + self.prefetch_shards])
-                worker_streams[worker_id].extend(
-                    (sample_index, next_raw_shards)
-                    for sample_index in shard_indices)
+            for _, shard_indices in shard_stream:
+                worker_sample_streams[worker_id].extend(shard_indices)
+
+        if self.round_up and sum(len(stream)
+                                 for stream in worker_sample_streams
+                                 ) < self.num_samples_per_rank:
+            for worker_id, stream in enumerate(worker_sample_streams):
+                if not stream:
+                    continue
+                target_len = (
+                    self.num_samples_per_rank + self.num_workers - 1 -
+                    worker_id) // self.num_workers
+                if len(stream) < target_len:
+                    source = tuple(stream)
+                    stream.extend(
+                        itertools.islice(
+                            itertools.cycle(source),
+                            target_len - len(stream)))
+
+        worker_streams = []
+        for stream in worker_sample_streams:
+            worker_stream = []
+            for pos, sample_index in enumerate(stream):
+                next_sample_indices = tuple(stream[pos + 1:pos + 1 +
+                                                   self.prefetch_samples])
+                worker_stream.append((sample_index, next_sample_indices))
+            worker_streams.append(worker_stream)
 
         indices = []
         max_stream_len = max((len(stream) for stream in worker_streams),

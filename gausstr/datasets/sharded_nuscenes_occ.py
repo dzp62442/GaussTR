@@ -26,6 +26,7 @@ class NuScenesOccShardedDataset(BaseDataset):
                  max_cache_bytes=24 * 1024**3,
                  prefetch_shards=1,
                  prefetch_workers=1,
+                 prefetch_max_tasks_per_call=0,
                  debug=False,
                  debug_interval=100,
                  slow_log_threshold=0.0,
@@ -57,6 +58,7 @@ class NuScenesOccShardedDataset(BaseDataset):
         self.max_cache_bytes = int(max_cache_bytes)
         self.prefetch_shards = int(prefetch_shards)
         self.prefetch_workers = int(prefetch_workers)
+        self.prefetch_max_tasks_per_call = int(prefetch_max_tasks_per_call)
         self.debug = bool(debug)
         self.debug_interval = int(debug_interval)
         self.slow_log_threshold = float(slow_log_threshold)
@@ -103,6 +105,7 @@ class NuScenesOccShardedDataset(BaseDataset):
             max_cache_bytes=self.max_cache_bytes,
             prefetch_shards=self.prefetch_shards,
             prefetch_workers=self.prefetch_workers,
+            prefetch_max_tasks_per_call=self.prefetch_max_tasks_per_call,
             raw_group=self.required_groups.get('raw', 'raw_nuscenes'),
             raw_shard_order=self.raw_shard_order,
             debug=self.debug,
@@ -147,8 +150,9 @@ class NuScenesOccShardedDataset(BaseDataset):
     @staticmethod
     def _parse_index(idx):
         if isinstance(idx, tuple) and len(idx) == 2:
-            sample_index, next_raw_shards = idx
-            return int(sample_index), tuple(str(item) for item in next_raw_shards)
+            sample_index, next_sample_indices = idx
+            return int(sample_index), tuple(
+                int(item) for item in next_sample_indices)
         return int(idx), None
 
     def get_data_info(self, idx: int) -> dict:
@@ -156,14 +160,14 @@ class NuScenesOccShardedDataset(BaseDataset):
             self.full_init()
         store = self._get_store()
 
-        sample_index, next_raw_shards = self._parse_index(idx)
+        sample_index, next_sample_indices = self._parse_index(idx)
         item = self.data_list[sample_index]
         sample_idx = str(item['sample_idx'])
         raw_group = self.required_groups.get('raw', 'raw_nuscenes')
         raw_sample = store.get(
             raw_group,
             sample_idx,
-            prefetch_raw_shard_ids=next_raw_shards)
+            prefetch_sample_indices=next_sample_indices)
 
         results = copy.deepcopy(raw_sample['meta'])
         results['sample_idx'] = sample_idx
