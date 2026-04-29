@@ -116,7 +116,7 @@ class NuScenesOccChunkDataset(IterableDataset):
     METAINFO = NuScenesOccDataset.METAINFO
 
     def __init__(self,
-                 chunk_root='data/gausstr_shards',
+                 chunk_root='data/gausstr_chunks',
                  split='train',
                  profile='featup_metric3d_sam2',
                  pipeline=None,

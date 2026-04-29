@@ -62,7 +62,7 @@ nuScenes annotation + 原始/派生数据目录
 建议新增：
 
 ```text
-data/gausstr_shards/
+data/gausstr_chunks/
   train/
     featup_metric3d_sam2/
       profile.json
@@ -85,13 +85,13 @@ data/gausstr_shards/
 实现时默认输出根目录使用：
 
 ```text
-data/gausstr_shards/
+data/gausstr_chunks/
 ```
 
 因此实际目录是：
 
 ```text
-data/gausstr_shards/
+data/gausstr_chunks/
   train/
     featup_metric3d_sam2/
       profile.json
@@ -559,7 +559,7 @@ train_dataloader = dict(
     prefetch_factor=1,
     dataset=dict(
         type="NuScenesOccChunkDataset",
-        chunk_root="data/gausstr_shards",
+        chunk_root="data/gausstr_chunks",
         split="train",
         profile="featup_metric3d_sam2",
         chunk_shuffle=True,

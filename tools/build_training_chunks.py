@@ -122,8 +122,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--out-root',
         type=Path,
-        default=Path('data/gausstr_shards'),
-        help='Output root. Defaults to data/gausstr_shards and can be a symlink to a TOS mount path.')
+        default=Path('data/gausstr_chunks'),
+        help='Output root. Defaults to data/gausstr_chunks and can be a symlink to a TOS mount path.')
     parser.add_argument(
         '--ratio',
         type=float,
