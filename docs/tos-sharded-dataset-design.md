@@ -323,20 +323,26 @@ raw_nuscenes 用 raw target，默认约 100MB
 
 ```text
 每个 rank 先获得一组 raw shard
-每个 raw shard 内按 epoch seed shuffle 样本
+每个 raw shard 内按 epoch seed shuffle 局部 sample block
 raw shard 以 worker stream 为单位分配
 sampler 按 worker round-robin 交错输出样本
 ```
 
 在 `batch_size=1`、`sampler.num_workers == dataloader.num_workers` 时，PyTorch DataLoader 会把交错后的第 `i, i + num_workers, ...` 个样本发给同一个 worker，因此每个 worker 实际消费的是自己的 raw shard stream。
 
+`num_workers` 不能只按 CPU 数量拉高。每个 rank 分到的 raw shard 数如果不能较均匀地分给 worker，epoch 尾部会只剩少数 worker stream 还有样本；这些尾部样本会被 PyTorch 继续轮询分发到多个 worker，造成未预取 shard 的同步加载、重复加载和 DDP straggler。对 TOS/FUSE 路径，过多 worker 还会把 200MiB 级 `.torch` 并发读打到极低带宽。10% train shard 的 4 卡稳定性验证配置使用 `num_workers=1`，先把每 rank 的前台读并发压到 1；如果 slow-load 日志显示单包带宽稳定，再逐步尝试 2 或 3 worker。
+
 这个约束不是普通 sample-level 随机采样；它是 shard-local 随机采样。随机性来自：
 
 - epoch 级 raw shard shuffle；
-- shard 内 sample shuffle；
+- shard 内局部 sample block shuffle；
 - DDP rank 间 raw shard 分片。
 
-不能在 worker 内再通过 sorted shard id 推断“下一个 raw shard”。sampler 必须把 worker-local 的 next raw shard 信息随样本索引一起传给 dataset/store，否则 worker 预取会沿全局 sorted 顺序走，和真实消费顺序不一致。
+不应对 raw shard 内全部样本做完全随机排列。当前 derived groups 的 shard 粒度不同，`depth_metric3d` 约 8 samples/shard、`feats_featup` 约 16 samples/shard、`sem_seg_grounded_sam2` 约 24 samples/shard。如果 raw shard 内样本完全随机，一个 worker 在进入 raw shard 的前十几个样本内就可能同步 miss 多个 depth/feat/sem 包，启动期会被放大成多卡多 worker 的 TOS 并发读风暴。训练配置使用 `sample_shuffle_block_size=16`，让 block 间随机、block 内保持连续，兼顾局部性和训练随机性。
+
+不能在 worker 内再通过 sorted shard id 推断“下一个 raw shard”，也不能只按 raw shard 覆盖区间生成 derived group 预取任务。sampler 必须把 worker-local 的后续 sample 信息随样本索引一起传给 dataset/store，否则 worker 预取会沿全局 sorted 顺序或 offset range 走，和真实消费顺序不一致。
+
+更进一步，预取不能只知道 next raw shard。因为 raw shard 内部还会按局部 block shuffle，derived group 的真实访问顺序由随机后的 sample 顺序决定。`ShardAwareSampler` 必须随当前 sample 传入同一个 worker stream 中随机打乱后的后续 `prefetch_samples` 个 sample index；`ShardMemoryStore` 再按这些 sample index 的真实顺序生成 `(group, shard_id)` 预取任务。这样预取顺序与实际读取顺序一致。
 
 ## 8. dataloader 设计
 
@@ -390,12 +396,12 @@ cache 预算按 DataLoader worker 进程设置：
 max_cache_bytes = 24GB per DataLoader worker process
 ```
 
-当前 sharded 训练配置默认 `num_workers=8`，因此理论上限是：
+当前 10% sharded 稳定性验证配置默认 `num_workers=1`，因此理论上限是：
 
 ```text
-1 GPU, 8 workers: 24GB/worker -> 192GB shard cache budget
-4 GPU, 8 workers/rank: 24GB/worker -> 768GB shard cache budget
-8 GPU, 8 workers/rank: 24GB/worker -> 1536GB shard cache budget
+1 GPU, 1 worker: 24GB/worker -> 24GB shard cache budget
+4 GPU, 1 worker/rank: 24GB/worker -> 96GB shard cache budget
+8 GPU, 1 worker/rank: 24GB/worker -> 192GB shard cache budget
 ```
 
 这是上限，不是启动时立即占用；实际占用取决于每个 worker 当前访问过的 shard 和 LRU 逐出。这个 cache 是内存 cache，不落盘。
@@ -408,7 +414,7 @@ max_cache_bytes = 24GB per DataLoader worker process
 
 ```text
 num_workers > 0
-prefetch_factor = 2 or 4
+prefetch_factor = 1
 persistent_workers = True
 pin_memory = True
 ```
@@ -417,9 +423,9 @@ pin_memory = True
 
 ```text
 当前 sample 访问了 raw_nuscenes/000123
-sampler 随当前 sample 传入当前 worker stream 的 next raw shard id
-根据 next raw shard 覆盖的 global offset 区间
-找到其覆盖的 raw/depth/feat/sem shards
+sampler 随当前 sample 传入当前 worker stream 的后续 sample indices
+根据随机打乱后的后续 sample index
+按真实访问顺序找到 raw/depth/feat/sem shard
 后台线程提前 torch.load 这些 shard 到 LRU
 ```
 
@@ -428,11 +434,15 @@ sampler 随当前 sample 传入当前 worker stream 的 next raw shard id
 推荐默认：
 
 ```text
-prefetch_shards = 1
-prefetch_workers = 1
+prefetch_shards = 0
+prefetch_samples = 16
+prefetch_workers = 0
+prefetch_max_tasks_per_call = 0
 ```
 
-含义是访问当前 raw shard 时，后台预取当前 worker stream 的下一个 raw shard 及其覆盖的 required group shards。预取线程只读 TOS mount，不写本地盘。
+含义是当前稳定性验证阶段关闭 `ShardMemoryStore` 后台预取，只依赖 PyTorch DataLoader worker 的异步取样。这样可以避免前台 worker 与后台 prefetch 线程同时对 TOS/FUSE 发起大量 200MiB 级读取。`prefetch_samples` 保留在 sampler 输出中，便于后续重新打开 shard 预取时继续按真实 sample 顺序生成任务。
+
+如果后续重新打开后台 shard 预取，由于一个 raw shard 可能覆盖多个 depth/feat/sem shard，不能在一次 sample 访问里把下一个 raw shard 覆盖的所有包全部提交到后台队列。应使用较小的 `prefetch_max_tasks_per_call`，把启动期和 shard 切换期的 TOS 读峰值摊平。
 
 预取窗口不应包含当前 raw shard。当前样本所需的 raw 和派生 group 如果未命中，应该由前台同步加载；后台预取只负责下一段 worker-local raw shard，避免启动阶段把当前 shard 覆盖的所有派生 shard 都压入后台队列，造成 TOS 并发读放大和错误预取。
 
@@ -551,11 +561,16 @@ lazy 模式下，训练期主要开销包括：
 ```python
 train_dataloader = dict(
     batch_size=1,
-    num_workers=8,
+    num_workers=1,
     persistent_workers=True,
     pin_memory=True,
-    prefetch_factor=2,
-    sampler=dict(type='ShardAwareSampler', shuffle=True, num_workers=8),
+    prefetch_factor=1,
+    sampler=dict(
+        type='ShardAwareSampler',
+        shuffle=True,
+        num_workers=1,
+        sample_shuffle_block_size=16,
+        prefetch_samples=16),
     dataset=dict(
         type='NuScenesOccShardedDataset',
         shard_root='data/gausstr_shards',
@@ -563,8 +578,9 @@ train_dataloader = dict(
         preload_mode='lazy',
         require_success=False,
         max_cache_bytes=24 * 1024**3,
-        prefetch_shards=1,
-        prefetch_workers=1,
+        prefetch_shards=0,
+        prefetch_workers=0,
+        prefetch_max_tasks_per_call=0,
         debug=False,
         debug_interval=100,
         required_groups=dict(
