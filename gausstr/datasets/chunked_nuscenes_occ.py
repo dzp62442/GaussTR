@@ -184,6 +184,9 @@ class NuScenesOccChunkDataset(IterableDataset):
         self.index_samples = sorted(
             self.index.get('samples', []),
             key=lambda item: int(item['global_offset']))
+        self._metainfo['expected_sample_idx'] = [
+            str(item['sample_idx']) for item in self.index_samples
+        ]
         self.chunk_by_id = {str(chunk['chunk_id']): chunk for chunk in self.chunks}
         self._chunk_byte_cache = {}
 
@@ -201,7 +204,13 @@ class NuScenesOccChunkDataset(IterableDataset):
         if self.split == 'train' and self.pad_train_chunks and self.chunks:
             chunks_per_rank = (len(self.chunks) + world_size - 1) // world_size
             return chunks_per_rank * self.samples_per_chunk
-        return len(self._eval_items_for_rank(rank, world_size))
+        if self.split == 'train':
+            chunks = self._partition_chunks(self._ordered_chunks(self._epoch))
+            return len(chunks) * self.samples_per_chunk
+        # MMEngine passes len(dataset) as the collection size to BaseMetric.
+        # Val/test iteration is rank-partitioned internally, but metric
+        # collection must be truncated to the global number of real samples.
+        return self.num_valid_samples
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
