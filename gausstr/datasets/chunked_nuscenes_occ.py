@@ -124,6 +124,9 @@ class NuScenesOccChunkDataset(IterableDataset):
                  chunk_shuffle=True,
                  sample_shuffle=True,
                  seed=2026,
+                 mini=False,
+                 mini_stride=10,
+                 mini_offset=0,
                  pad_train_chunks=True,
                  skip_padding=True,
                  load_to_memory=False,
@@ -153,6 +156,14 @@ class NuScenesOccChunkDataset(IterableDataset):
         self.chunk_shuffle = bool(chunk_shuffle)
         self.sample_shuffle = bool(sample_shuffle)
         self.seed = int(seed)
+        self.mini = bool(mini)
+        self.mini_stride = int(mini_stride)
+        self.mini_offset = int(mini_offset)
+        if self.mini_stride <= 0:
+            raise ValueError('mini_stride must be a positive integer.')
+        if self.mini_offset < 0 or self.mini_offset >= self.mini_stride:
+            raise ValueError(
+                'mini_offset must satisfy 0 <= mini_offset < mini_stride.')
         self.pad_train_chunks = bool(pad_train_chunks)
         self.skip_padding = bool(skip_padding)
         self.prefetch_chunks = max(0, int(prefetch_chunks))
@@ -174,16 +185,25 @@ class NuScenesOccChunkDataset(IterableDataset):
                                         'chunk_manifest.json')
         self.index = self._load_json(self.profile_root / 'index.json')
         self.profile_meta = self._load_json(self.profile_root / 'profile.json')
-        self.chunks = [
+        chunks = [
             dict(chunk_id=chunk_id, **entry)
             for chunk_id, entry in sorted(self.manifest['chunks'].items())
         ]
-        self.num_valid_samples = int(self.manifest.get(
-            'num_samples', self.index.get('num_samples', 0)))
         self.samples_per_chunk = int(self.manifest['samples_per_chunk'])
-        self.index_samples = sorted(
+        index_samples = sorted(
             self.index.get('samples', []),
             key=lambda item: int(item['global_offset']))
+        self.index_samples = self._select_index_samples(index_samples)
+        self.num_valid_samples = len(self.index_samples)
+        self._selected_offsets_by_chunk = self._group_offsets_by_chunk(
+            self.index_samples)
+        if self.mini:
+            selected_chunk_ids = set(self._selected_offsets_by_chunk)
+            chunks = [
+                chunk for chunk in chunks
+                if str(chunk['chunk_id']) in selected_chunk_ids
+            ]
+        self.chunks = chunks
         self._metainfo['expected_sample_idx'] = [
             str(item['sample_idx']) for item in self.index_samples
         ]
@@ -195,12 +215,32 @@ class NuScenesOccChunkDataset(IterableDataset):
         with path.open('r', encoding='utf-8') as f:
             return json.load(f)
 
+    def _select_index_samples(self, index_samples):
+        if self.mini:
+            index_samples = index_samples[self.mini_offset::self.mini_stride]
+        return [
+            dict(item, _selected_offset=selected_offset)
+            for selected_offset, item in enumerate(index_samples)
+        ]
+
+    @staticmethod
+    def _group_offsets_by_chunk(index_samples):
+        grouped_offsets = {}
+        for item in index_samples:
+            chunk_id = str(item['chunk_id'])
+            offset = int(item['offset'])
+            chunk_offsets = grouped_offsets.setdefault(chunk_id, {})
+            chunk_offsets[offset] = chunk_offsets.get(offset, 0) + 1
+        return grouped_offsets
+
     @property
     def metainfo(self):
         return copy.deepcopy(self._metainfo)
 
     def __len__(self):
         rank, world_size = get_dist_info()
+        if self.split == 'train' and self.mini:
+            return len(self._train_mini_items_for_worker(self._epoch))
         if self.split == 'train' and self.pad_train_chunks and self.chunks:
             chunks_per_rank = (len(self.chunks) + world_size - 1) // world_size
             return chunks_per_rank * self.samples_per_chunk
@@ -261,11 +301,38 @@ class NuScenesOccChunkDataset(IterableDataset):
             rng.shuffle(chunks)
         return chunks
 
+    def _train_mini_items_for_worker(self, epoch: int):
+        items = list(self.index_samples)
+        if items and (self.chunk_shuffle or self.sample_shuffle):
+            rng = random.Random(self.seed + epoch)
+            rng.shuffle(items)
+
+        rank, world_size = get_dist_info()
+        worker = get_worker_info()
+        worker_id = 0 if worker is None else worker.id
+        num_workers = 1 if worker is None else worker.num_workers
+        num_partitions = world_size * num_workers
+
+        if self.pad_train_chunks and items:
+            total = ((len(items) + num_partitions - 1) // num_partitions *
+                     num_partitions)
+            for i in range(total - len(items)):
+                items.append(items[i % len(items)])
+
+        partition_id = rank * num_workers + worker_id
+        return items[partition_id::num_partitions]
+
+    def _partition_train_mini_chunks(self, epoch: int):
+        grouped_offsets = self._group_offsets_by_chunk(
+            self._train_mini_items_for_worker(epoch))
+        return [(self.chunk_by_id[chunk_id], offsets)
+                for chunk_id, offsets in grouped_offsets.items()]
+
     def _eval_items_for_rank(self, rank: int,
                              world_size: int) -> Sequence[Mapping]:
         return [
             item for item in self.index_samples
-            if int(item['global_offset']) % world_size == rank
+            if int(item['_selected_offset']) % world_size == rank
         ]
 
     def _partition_eval_chunks(self):
@@ -278,11 +345,7 @@ class NuScenesOccChunkDataset(IterableDataset):
                 if pos % worker.num_workers == worker.id
             ]
 
-        grouped_offsets = {}
-        for item in rank_items:
-            chunk_id = str(item['chunk_id'])
-            grouped_offsets.setdefault(chunk_id, set()).add(int(item['offset']))
-
+        grouped_offsets = self._group_offsets_by_chunk(rank_items)
         return [(self.chunk_by_id[chunk_id], offsets)
                 for chunk_id, offsets in grouped_offsets.items()]
 
@@ -465,20 +528,24 @@ class NuScenesOccChunkDataset(IterableDataset):
                       chunk_entry: Mapping,
                       payload: Mapping,
                       epoch: int,
-                      valid_offsets: Optional[set] = None):
-        samples = list(payload['samples'])
+                      valid_offsets: Optional[Mapping[int, int]] = None):
+        indexed_samples = list(enumerate(payload['samples']))
         if self.split == 'train' and self.sample_shuffle:
             rng = random.Random(self.seed + epoch * 1000003 +
                                 int(chunk_entry['chunk_id']))
-            rng.shuffle(samples)
-        for offset, sample in enumerate(samples):
-            if valid_offsets is not None and offset not in valid_offsets:
-                continue
+            rng.shuffle(indexed_samples)
+        for offset, sample in indexed_samples:
+            repeats = 1
+            if valid_offsets is not None:
+                if offset not in valid_offsets:
+                    continue
+                repeats = int(valid_offsets[offset])
             if sample.get('is_padding', False) and self.skip_padding:
                 continue
-            data = self.pipeline(self._sample_to_results(sample))
-            if data is not None:
-                yield data
+            for _ in range(repeats):
+                data = self.pipeline(self._sample_to_results(sample))
+                if data is not None:
+                    yield data
 
     def _current_epoch(self) -> int:
         with self._shared_epoch_set.get_lock():
@@ -493,6 +560,16 @@ class NuScenesOccChunkDataset(IterableDataset):
     def __iter__(self):
         epoch = self._current_epoch()
         if self.split == 'train':
+            if self.mini:
+                train_chunks = self._partition_train_mini_chunks(epoch)
+                self._ensure_chunk_cache([chunk for chunk, _ in train_chunks])
+                for (chunk, offsets), (_, payload) in zip(
+                        train_chunks, self._iter_chunk_payloads(
+                            [chunk for chunk, _ in train_chunks])):
+                    yield from self._iter_samples(
+                        chunk, payload, epoch, valid_offsets=offsets)
+                return
+
             chunks = self._train_chunks_for_worker(epoch)
             self._ensure_chunk_cache(chunks)
             for chunk, payload in self._iter_chunk_payloads(chunks):
