@@ -141,9 +141,12 @@ class NuScenesOccChunkDataset(IterableDataset):
                  **kwargs):
         super().__init__()
         if metainfo is None:
-            metainfo = self.METAINFO
+            metainfo = copy.deepcopy(self.METAINFO)
         elif 'classes' not in metainfo:
+            metainfo = copy.deepcopy(metainfo)
             metainfo['classes'] = self.METAINFO['classes']
+        else:
+            metainfo = copy.deepcopy(metainfo)
         metainfo['label2cat'] = {
             i: cat_name
             for i, cat_name in enumerate(metainfo['classes'])
@@ -246,11 +249,7 @@ class NuScenesOccChunkDataset(IterableDataset):
         if self.split == 'train':
             chunks = self._partition_chunks(self._ordered_chunks(self._epoch))
             return len(chunks) * self.samples_per_chunk
-        if self.mini:
-            return sum(
-                len(self._selected_offsets_by_chunk[str(chunk['chunk_id'])])
-                for chunk in self.chunks[rank::world_size])
-        return len(self._eval_items_for_rank(rank, world_size))
+        return self.num_valid_samples
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
@@ -312,25 +311,13 @@ class NuScenesOccChunkDataset(IterableDataset):
         rank, world_size = get_dist_info()
         worker = get_worker_info()
 
-        if self.mini:
-            rank_chunks = self.chunks[rank::world_size]
-            if worker is not None:
-                rank_chunks = rank_chunks[worker.id::worker.num_workers]
-            return [
-                (chunk, self._selected_offsets_by_chunk[str(chunk['chunk_id'])])
-                for chunk in rank_chunks
-            ]
-
-        rank_items = self._eval_items_for_rank(rank, world_size)
+        rank_chunks = self.chunks[rank::world_size]
         if worker is not None:
-            rank_items = [
-                item for pos, item in enumerate(rank_items)
-                if pos % worker.num_workers == worker.id
-            ]
-
-        grouped_offsets = self._group_offsets_by_chunk(rank_items)
-        return [(self.chunk_by_id[chunk_id], offsets)
-                for chunk_id, offsets in grouped_offsets.items()]
+            rank_chunks = rank_chunks[worker.id::worker.num_workers]
+        return [
+            (chunk, self._selected_offsets_by_chunk[str(chunk['chunk_id'])])
+            for chunk in rank_chunks
+        ]
 
     def _chunk_path(self, entry: Mapping) -> Path:
         return self.profile_root / entry['path']
