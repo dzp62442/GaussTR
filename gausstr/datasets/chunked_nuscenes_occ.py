@@ -189,20 +189,22 @@ class NuScenesOccChunkDataset(IterableDataset):
             dict(chunk_id=chunk_id, **entry)
             for chunk_id, entry in sorted(self.manifest['chunks'].items())
         ]
+        if self.mini:
+            chunks = chunks[self.mini_offset::self.mini_stride]
+        selected_chunk_ids = {str(chunk['chunk_id']) for chunk in chunks}
         self.samples_per_chunk = int(self.manifest['samples_per_chunk'])
         index_samples = sorted(
             self.index.get('samples', []),
             key=lambda item: int(item['global_offset']))
-        self.index_samples = self._select_index_samples(index_samples)
+        if self.mini:
+            index_samples = [
+                item for item in index_samples
+                if str(item['chunk_id']) in selected_chunk_ids
+            ]
+        self.index_samples = self._index_with_selected_offsets(index_samples)
         self.num_valid_samples = len(self.index_samples)
         self._selected_offsets_by_chunk = self._group_offsets_by_chunk(
             self.index_samples)
-        if self.mini:
-            selected_chunk_ids = set(self._selected_offsets_by_chunk)
-            chunks = [
-                chunk for chunk in chunks
-                if str(chunk['chunk_id']) in selected_chunk_ids
-            ]
         self.chunks = chunks
         self._metainfo['expected_sample_idx'] = [
             str(item['sample_idx']) for item in self.index_samples
@@ -215,9 +217,8 @@ class NuScenesOccChunkDataset(IterableDataset):
         with path.open('r', encoding='utf-8') as f:
             return json.load(f)
 
-    def _select_index_samples(self, index_samples):
-        if self.mini:
-            index_samples = index_samples[self.mini_offset::self.mini_stride]
+    @staticmethod
+    def _index_with_selected_offsets(index_samples):
         return [
             dict(item, _selected_offset=selected_offset)
             for selected_offset, item in enumerate(index_samples)
@@ -239,8 +240,6 @@ class NuScenesOccChunkDataset(IterableDataset):
 
     def __len__(self):
         rank, world_size = get_dist_info()
-        if self.split == 'train' and self.mini:
-            return len(self._train_mini_items_for_worker(self._epoch))
         if self.split == 'train' and self.pad_train_chunks and self.chunks:
             chunks_per_rank = (len(self.chunks) + world_size - 1) // world_size
             return chunks_per_rank * self.samples_per_chunk
@@ -301,33 +300,6 @@ class NuScenesOccChunkDataset(IterableDataset):
             rng.shuffle(chunks)
         return chunks
 
-    def _train_mini_items_for_worker(self, epoch: int):
-        items = list(self.index_samples)
-        if items and (self.chunk_shuffle or self.sample_shuffle):
-            rng = random.Random(self.seed + epoch)
-            rng.shuffle(items)
-
-        rank, world_size = get_dist_info()
-        worker = get_worker_info()
-        worker_id = 0 if worker is None else worker.id
-        num_workers = 1 if worker is None else worker.num_workers
-        num_partitions = world_size * num_workers
-
-        if self.pad_train_chunks and items:
-            total = ((len(items) + num_partitions - 1) // num_partitions *
-                     num_partitions)
-            for i in range(total - len(items)):
-                items.append(items[i % len(items)])
-
-        partition_id = rank * num_workers + worker_id
-        return items[partition_id::num_partitions]
-
-    def _partition_train_mini_chunks(self, epoch: int):
-        grouped_offsets = self._group_offsets_by_chunk(
-            self._train_mini_items_for_worker(epoch))
-        return [(self.chunk_by_id[chunk_id], offsets)
-                for chunk_id, offsets in grouped_offsets.items()]
-
     def _eval_items_for_rank(self, rank: int,
                              world_size: int) -> Sequence[Mapping]:
         return [
@@ -338,6 +310,16 @@ class NuScenesOccChunkDataset(IterableDataset):
     def _partition_eval_chunks(self):
         rank, world_size = get_dist_info()
         worker = get_worker_info()
+
+        if self.mini:
+            rank_chunks = self.chunks[rank::world_size]
+            if worker is not None:
+                rank_chunks = rank_chunks[worker.id::worker.num_workers]
+            return [
+                (chunk, self._selected_offsets_by_chunk[str(chunk['chunk_id'])])
+                for chunk in rank_chunks
+            ]
+
         rank_items = self._eval_items_for_rank(rank, world_size)
         if worker is not None:
             rank_items = [
@@ -560,16 +542,6 @@ class NuScenesOccChunkDataset(IterableDataset):
     def __iter__(self):
         epoch = self._current_epoch()
         if self.split == 'train':
-            if self.mini:
-                train_chunks = self._partition_train_mini_chunks(epoch)
-                self._ensure_chunk_cache([chunk for chunk, _ in train_chunks])
-                for (chunk, offsets), (_, payload) in zip(
-                        train_chunks, self._iter_chunk_payloads(
-                            [chunk for chunk, _ in train_chunks])):
-                    yield from self._iter_samples(
-                        chunk, payload, epoch, valid_offsets=offsets)
-                return
-
             chunks = self._train_chunks_for_worker(epoch)
             self._ensure_chunk_cache(chunks)
             for chunk, payload in self._iter_chunk_payloads(chunks):
