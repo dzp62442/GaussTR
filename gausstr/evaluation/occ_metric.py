@@ -219,6 +219,12 @@ class OccMetric(BaseMetric):
             return None
         return {str(item) for item in expected}
 
+    def evaluate(self, size: int):
+        expected_sample_idx = self._expected_sample_idx()
+        if expected_sample_idx is not None:
+            size = len(expected_sample_idx)
+        return super().evaluate(size)
+
     def compute_metrics(self, results):
         """Compute the metrics from processed results.
 
