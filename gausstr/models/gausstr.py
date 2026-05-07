@@ -22,8 +22,12 @@ class GaussTR(BaseModel):
                  encoder=None,
                  pos_embed=None,
                  attn_type=None,
+                 eval_fixed_reference_points=True,
+                 eval_reference_point_seed=0,
                  **kwargs):
         super().__init__(**kwargs)
+        self.eval_fixed_reference_points = bool(eval_fixed_reference_points)
+        self.eval_reference_point_seed = int(eval_reference_point_seed)
         if backbone is not None:
             if backbone.type == 'TorchHubModel':
                 self.backbone = torch.hub.load(backbone.repo_or_dir,
@@ -279,7 +283,14 @@ class GaussTR(BaseModel):
     def pre_decoder(self, memory):
         bs, _, c = memory.shape
         query = self.query_embeds.weight.unsqueeze(0).expand(bs, -1, -1)
-        reference_points = torch.rand((bs, query.size(1), 2)).to(query)
+        if self.training or not self.eval_fixed_reference_points:
+            reference_points = torch.rand((bs, query.size(1), 2)).to(query)
+        else:
+            generator = torch.Generator(device='cpu')
+            generator.manual_seed(self.eval_reference_point_seed)
+            reference_points = torch.rand(
+                (1, query.size(1), 2), generator=generator).to(query)
+            reference_points = reference_points.expand(bs, -1, -1)
 
         decoder_inputs_dict = dict(
             query=query, memory=memory, reference_points=reference_points)
