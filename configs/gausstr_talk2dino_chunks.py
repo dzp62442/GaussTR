@@ -1,11 +1,8 @@
+import copy
+
 _base_ = './gausstr_talk2dino.py'
 
 log_processor = dict(window_size=50, by_epoch=True)
-
-custom_hooks = [
-    dict(type='AutoResumeHook'),
-    dict(type='ChunkDatasetEpochHook'),
-]
 
 default_hooks = dict(logger=dict(type='LoggerHook', interval=50))
 
@@ -113,7 +110,7 @@ val_dataloader = dict(
         chunk_shuffle=False,
         sample_shuffle=False,
         seed=2026,
-        mini=False,
+        mini=True,
         mini_stride=10,
         mini_offset=0,
         pad_train_chunks=False,
@@ -122,4 +119,24 @@ val_dataloader = dict(
         slow_log_threshold=1.0,
         pipeline=val_pipeline))
 
-test_dataloader = val_dataloader
+test_dataloader = copy.deepcopy(val_dataloader)
+test_dataloader['dataset']['mini'] = False
+
+full_eval_dataloader = copy.deepcopy(test_dataloader)
+
+val_evaluator = dict(
+    type='OccMetric',
+    num_classes=18,
+    use_lidar_mask=False,
+    use_image_mask=True)
+test_evaluator = copy.deepcopy(val_evaluator)
+full_eval_evaluator = copy.deepcopy(test_evaluator)
+
+custom_hooks = [
+    dict(type='AutoResumeHook'),
+    dict(type='ChunkDatasetEpochHook'),
+    dict(
+        type='FinalFullEvalHook',
+        dataloader=full_eval_dataloader,
+        evaluator=full_eval_evaluator),
+]
