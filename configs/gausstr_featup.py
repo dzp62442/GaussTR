@@ -14,6 +14,15 @@ default_hooks = dict(
         save_param_scheduler=True,
         save_last=True))
 
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    dict(type='GaussTRTensorboardVisBackend'),
+]
+visualizer = dict(
+    type='Det3DLocalVisualizer',
+    vis_backends=vis_backends,
+    name='visualizer')
+
 input_size = (432, 768)
 embed_dims = 256
 feat_dims = 512

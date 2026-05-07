@@ -20,6 +20,7 @@ matplotlib
 pillow
 pandas
 seaborn
+tensorboard==2.20.0
 taichi
 timm
 ftfy
