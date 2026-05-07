@@ -249,7 +249,7 @@ class NuScenesOccChunkDataset(IterableDataset):
         if self.split == 'train':
             chunks = self._partition_chunks(self._ordered_chunks(self._epoch))
             return len(chunks) * self.samples_per_chunk
-        return self.num_valid_samples
+        return self._eval_len_for_rank(rank, world_size)
 
     def set_epoch(self, epoch: int) -> None:
         self._epoch = int(epoch)
@@ -306,6 +306,15 @@ class NuScenesOccChunkDataset(IterableDataset):
             item for item in self.index_samples
             if int(item['_selected_offset']) % world_size == rank
         ]
+
+    def _eval_len_for_rank(self, rank: int, world_size: int) -> int:
+        rank_chunk_ids = {
+            str(chunk['chunk_id'])
+            for chunk in self.chunks[rank::world_size]
+        }
+        return sum(
+            1 for item in self.index_samples
+            if str(item['chunk_id']) in rank_chunk_ids)
 
     def _partition_eval_chunks(self):
         rank, world_size = get_dist_info()
