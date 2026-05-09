@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -12,6 +13,81 @@ from .utils import flatten_multi_scale_feats
 @MODELS.register_module()
 class GaussTR(BaseModel):
 
+    @staticmethod
+    def _load_local_torchhub_model(backbone):
+        repo_or_dir = Path(backbone.repo_or_dir)
+        if not repo_or_dir.exists():
+            raise FileNotFoundError(
+                f'Local torch hub repo not found: {repo_or_dir}. '
+                'For Talk2DINO, manually clone or copy the DINOv2 repository '
+                'to third_party/dinov2, so third_party/dinov2/hubconf.py '
+                'exists. Example: git clone https://github.com/facebookresearch/dinov2.git '
+                'third_party/dinov2')
+        if not (repo_or_dir / 'hubconf.py').is_file():
+            raise FileNotFoundError(
+                f'Local torch hub repo is missing hubconf.py: {repo_or_dir}. '
+                'For Talk2DINO, repo_or_dir should point to the DINOv2 '
+                'repository root, e.g. third_party/dinov2.')
+
+        checkpoint = getattr(backbone, 'checkpoint', None)
+        if checkpoint is None:
+            raise ValueError(
+                'TorchHubModel requires a local checkpoint path. Set '
+                '`checkpoint` to a file under ckpts/.')
+        checkpoint = Path(checkpoint)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(
+                f'Local backbone checkpoint not found: {checkpoint}. '
+                'For Talk2DINO, manually download the DINOv2 ViT-B/14 '
+                'register checkpoint and place it at '
+                'ckpts/dinov2_vitb14_reg4_pretrain.pth.')
+
+        hub_kwargs = {
+            key: value
+            for key, value in backbone.items()
+            if key not in {
+                'type', 'repo_or_dir', 'model_name', 'checkpoint', 'strict'
+            }
+        }
+        hub_kwargs.setdefault('source', 'local')
+        hub_kwargs.setdefault('pretrained', False)
+        if hub_kwargs['source'] != 'local':
+            raise ValueError(
+                'TorchHubModel is restricted to local loading. '
+                'Use source="local" and repo_or_dir under third_party/.')
+
+        try:
+            model = torch.hub.load(str(repo_or_dir), backbone.model_name,
+                                   **hub_kwargs)
+        except Exception as exc:
+            raise RuntimeError(
+                f'Failed to build local torch hub model '
+                f'{backbone.model_name!r} from {repo_or_dir}. '
+                'Check that third_party/dinov2 is a valid DINOv2 checkout '
+                'and supports this hub model name.') from exc
+        state = torch.load(checkpoint, map_location='cpu')
+        if isinstance(state, dict):
+            if 'state_dict' in state:
+                state = state['state_dict']
+            elif 'model' in state:
+                state = state['model']
+        if not isinstance(state, dict):
+            raise TypeError(
+                f'Unsupported checkpoint format in {checkpoint}: '
+                f'{type(state).__name__}')
+        state = {
+            key.removeprefix('module.').removeprefix('backbone.'): value
+            for key, value in state.items()
+        }
+        try:
+            model.load_state_dict(state, strict=backbone.get('strict', True))
+        except Exception as exc:
+            raise RuntimeError(
+                f'Failed to load local checkpoint {checkpoint} into '
+                f'{backbone.model_name!r}. Check that the checkpoint matches '
+                'DINOv2 ViT-B/14 register weights.') from exc
+        return model
+
     def __init__(self,
                  neck,
                  decoder,
@@ -22,12 +98,15 @@ class GaussTR(BaseModel):
                  encoder=None,
                  pos_embed=None,
                  attn_type=None,
+                 eval_fixed_reference_points=True,
+                 eval_reference_point_seed=0,
                  **kwargs):
         super().__init__(**kwargs)
+        self.eval_fixed_reference_points = bool(eval_fixed_reference_points)
+        self.eval_reference_point_seed = int(eval_reference_point_seed)
         if backbone is not None:
             if backbone.type == 'TorchHubModel':
-                self.backbone = torch.hub.load(backbone.repo_or_dir,
-                                               backbone.model_name)
+                self.backbone = self._load_local_torchhub_model(backbone)
                 self.backbone.requires_grad_(False)
                 self.backbone.is_init = True  # otherwise it will be re-inited by mmengine
                 self.patch_size = self.backbone.patch_size
@@ -279,7 +358,14 @@ class GaussTR(BaseModel):
     def pre_decoder(self, memory):
         bs, _, c = memory.shape
         query = self.query_embeds.weight.unsqueeze(0).expand(bs, -1, -1)
-        reference_points = torch.rand((bs, query.size(1), 2)).to(query)
+        if self.training or not self.eval_fixed_reference_points:
+            reference_points = torch.rand((bs, query.size(1), 2)).to(query)
+        else:
+            generator = torch.Generator(device='cpu')
+            generator.manual_seed(self.eval_reference_point_seed)
+            reference_points = torch.rand(
+                (1, query.size(1), 2), generator=generator).to(query)
+            reference_points = reference_points.expand(bs, -1, -1)
 
         decoder_inputs_dict = dict(
             query=query, memory=memory, reference_points=reference_points)

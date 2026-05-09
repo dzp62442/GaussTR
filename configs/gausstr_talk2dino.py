@@ -4,6 +4,7 @@ custom_imports = dict(imports=['gausstr'])
 
 custom_hooks = [
     dict(type='AutoResumeHook'),
+    dict(type='TensorboardRunHook'),
 ]
 
 default_hooks = dict(
@@ -13,6 +14,15 @@ default_hooks = dict(
         save_optimizer=True,
         save_param_scheduler=True,
         save_last=True))
+
+vis_backends = [
+    dict(type='LocalVisBackend'),
+    dict(type='GaussTRTensorboardVisBackend'),
+]
+visualizer = dict(
+    type='Det3DLocalVisualizer',
+    vis_backends=vis_backends,
+    name='visualizer')
 
 input_size = (504, 896)
 embed_dims = 256
@@ -29,8 +39,11 @@ model = dict(
         std=[58.395, 57.12, 57.375]),
     backbone=dict(
         type='TorchHubModel',
-        repo_or_dir='facebookresearch/dinov2',
-        model_name='dinov2_vitb14_reg'),
+        repo_or_dir='third_party/dinov2',
+        model_name='dinov2_vitb14_reg',
+        checkpoint='ckpts/dinov2_vitb14_reg4_pretrain.pth',
+        source='local',
+        pretrained=False),
     neck=dict(
         type='ViTDetFPN',
         in_channels=feat_dims,
@@ -172,7 +185,7 @@ optim_wrapper = dict(
     optimizer=dict(type='AdamW', lr=2e-4, weight_decay=5e-3),
     clip_grad=dict(max_norm=35, norm_type=2))
 
-train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=24, val_interval=1)
+train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=20, val_interval=1)
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
