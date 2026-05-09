@@ -134,6 +134,7 @@ full_eval_evaluator = copy.deepcopy(test_evaluator)
 
 custom_hooks = [
     dict(type='AutoResumeHook'),
+    dict(type='TensorboardRunHook'),
     dict(type='ChunkDatasetEpochHook'),
     dict(
         type='FinalFullEvalHook',

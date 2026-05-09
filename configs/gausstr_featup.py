@@ -4,6 +4,7 @@ custom_imports = dict(imports=['gausstr'])
 
 custom_hooks = [
     dict(type='AutoResumeHook'),
+    dict(type='TensorboardRunHook'),
 ]
 
 default_hooks = dict(
