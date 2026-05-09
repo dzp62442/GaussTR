@@ -20,6 +20,16 @@ def compute_occ_iou(hist, free_index):
     return tp / (hist.sum() - hist[free_index, free_index])
 
 
+def compute_miou_star(iou, label2cat, free_index):
+    """Compute PG-Occ-style mIoU without empty and two zero classes."""
+    ignored_categories = {'others', 'other_flat'}
+    valid_indices = [
+        idx for idx in range(free_index)
+        if label2cat[idx] not in ignored_categories
+    ]
+    return np.nanmean(iou[valid_indices])
+
+
 @METRICS.register_module()
 class OccMetric(BaseMetric):
 
@@ -264,23 +274,29 @@ class OccMetric(BaseMetric):
 
         iou = per_class_iou(hist)
         # if ignore_index is in iou, replace it with nan
-        miou = np.nanmean(iou[:-1])  # NOTE: ignore free class
+        free_index = self.num_classes - 1
+        miou = np.nanmean(iou[:free_index])  # NOTE: ignore free class
         label2cat = self.dataset_meta['label2cat']
+        miou_star = compute_miou_star(iou, label2cat, free_index)
+        occ_iou = compute_occ_iou(hist, free_index)
 
-        header = ['classes']
+        header = ['classes', 'iou', 'miou*', 'miou']
         for i in range(len(label2cat) - 1):
             header.append(label2cat[i])
-        header.extend(['miou', 'iou'])
 
         ret_dict = dict()
-        table_columns = [['results']]
+        ret_dict['iou'] = float(occ_iou)
+        ret_dict['miou*'] = float(miou_star)
+        ret_dict['miou'] = float(miou)
+        table_columns = [
+            ['results'],
+            [f'{occ_iou:.4f}'],
+            [f'{miou_star:.4f}'],
+            [f'{miou:.4f}'],
+        ]
         for i in range(len(label2cat) - 1):
             ret_dict[label2cat[i]] = float(iou[i])
             table_columns.append([f'{iou[i]:.4f}'])
-        ret_dict['miou'] = float(miou)
-        ret_dict['iou'] = compute_occ_iou(hist, self.num_classes - 1)
-        table_columns.append([f'{miou:.4f}'])
-        table_columns.append([f"{ret_dict['iou']:.4f}"])
 
         table_data = [header]
         table_rows = list(zip(*table_columns))

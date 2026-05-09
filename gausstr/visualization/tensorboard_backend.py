@@ -29,7 +29,7 @@ CLASS_IOU_TAGS = {
 }
 
 BASIC_TAGS = {'epoch', 'iter', 'lr', 'memory'}
-EVAL_TAGS = {'iou', 'miou'}
+EVAL_TAGS = {'iou', 'miou*', 'miou'}
 TIME_TAGS = {'data_time', 'time'}
 
 
@@ -40,11 +40,11 @@ class GaussTRTensorboardVisBackend(TensorboardVisBackend):
     @staticmethod
     def _format_scalar_name(name: str) -> str:
         if name in CLASS_IOU_TAGS:
-            return f'eval_class/{name}'
+            return f'eval_classes/{name}'
         if name in BASIC_TAGS:
             return f'basic/{name}'
         if name in EVAL_TAGS:
-            return f'eval/{name}'
+            return f'eval_all/{name}'
         if name in TIME_TAGS:
             return f'time/{name}'
         return name
