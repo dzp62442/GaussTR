@@ -160,7 +160,11 @@ cython_debug/
 #.idea/
 
 data/
+data
 work_dirs/
+work_dirs
 ckpts/
+ckpts
 third_party/
+third_party
 .codex
